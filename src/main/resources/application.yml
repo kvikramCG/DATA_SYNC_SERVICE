@@ -1,0 +1,73 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: data-sync-service
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: jdbc:postgresql://localhost:5432/datasync
+    username: ${DB_USERNAME:datasync}
+    password: ${DB_PASSWORD:datasync}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+orion:
+  base-url: ${ORION_BASE_URL:https://orion.example.com}
+  login: ${ORION_LOGIN:svc-data-sync}
+  password: ${ORION_PASSWORD:}
+  connect-timeout-ms: 5000
+  read-timeout-ms: 60000
+
+ledgerpoint:
+  base-url: ${LEDGERPOINT_BASE_URL:https://ledgerpoint.example.com}
+  api-key: ${LEDGERPOINT_API_KEY:}
+  connect-timeout-ms: 5000
+  read-timeout-ms: 60000
+  max-batch-size: 10000
+
+resilience4j:
+  ratelimiter:
+    instances:
+      orion:
+        limit-for-period: 5
+        limit-refresh-period: 1s
+        timeout-duration: 10s
+  retry:
+    instances:
+      orion:
+        max-attempts: 3
+        wait-duration: 300ms
+        exponential-backoff-multiplier: 2
+        retry-exceptions:
+          - com.datasync.domain.exception.OrionTransientException
+        ignore-exceptions:
+          - com.datasync.domain.exception.OrionClientException
+          - com.datasync.domain.exception.OrionAuthException
+      ledgerpoint:
+        max-attempts: 3
+        wait-duration: 300ms
+        exponential-backoff-multiplier: 2
+        retry-exceptions:
+          - com.datasync.domain.exception.LedgerPointTransientException
+        ignore-exceptions:
+          - com.datasync.domain.exception.LedgerPointValidationException
+          - com.datasync.domain.exception.LedgerPointUnknownSeriesException
+          - com.datasync.domain.exception.LedgerPointAuthException
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} %-5level [%X{correlationId}] %logger{36} - %msg%n"
