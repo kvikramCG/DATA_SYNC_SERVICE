@@ -84,6 +84,10 @@ public class SeriesEntity {
         return timeZoneCode;
     }
 
+    public void setTimeZoneCode(int timeZoneCode) {
+        this.timeZoneCode = timeZoneCode;
+    }
+
     public LocalDate getEarliestDataDate() {
         return earliestDataDate;
     }

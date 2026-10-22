@@ -15,7 +15,6 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
@@ -56,6 +55,8 @@ class SyncControllerIT {
         registry.add("orion.password", () -> "secret");
         registry.add("ledgerpoint.base-url", wireMockServer::baseUrl);
         registry.add("ledgerpoint.api-key", () -> "test-api-key");
+        // Fixtures carry fixed Oct-2026 lastUpdatedDate values; disable the staleness check (spec 6.9).
+        registry.add("datasync.sync.stale-after-days", () -> "100000");
     }
 
     @AfterAll
@@ -76,7 +77,7 @@ class SyncControllerIT {
             """;
 
     @Test
-    void triggersSyncAndCompletesJobSuccessfully() {
+    void triggersSyncAndCompletesJobSuccessfully() throws Exception {
         wireMockServer.stubFor(post(urlEqualTo("/auth/token")).willReturn(okJson(TOKEN_JSON)));
         wireMockServer.stubFor(get(urlPathEqualTo("/v1/series"))
                 .withQueryParam("type", equalTo("typeA"))
@@ -98,23 +99,37 @@ class SyncControllerIT {
         String url = "/api/series/typeA/sync?startDate=2026-10-15T00:00:00Z&endDate=2026-10-15T23:59:59Z";
         ResponseEntity<JobSummaryResponse> response = restTemplate.postForEntity(url, null, JobSummaryResponse.class);
 
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
         JobSummaryResponse summary = response.getBody();
         assertThat(summary).isNotNull();
         assertThat(summary.jobId()).isNotNull();
         assertThat(summary.seriesType()).isEqualTo("typeA");
-        assertThat(summary.status()).isEqualTo("COMPLETED");
-        assertThat(summary.taskCounts()).containsEntry("SUCCESS", 1);
+        assertThat(summary.status()).isEqualTo("RUNNING");
+        assertThat(response.getHeaders().getLocation()).isNotNull();
+        assertThat(response.getHeaders().getLocation().getPath()).isEqualTo("/api/jobs/" + summary.jobId());
 
-        ResponseEntity<JobDetailResponse> detail =
-                restTemplate.getForEntity("/api/jobs/" + summary.jobId(), JobDetailResponse.class);
+        JobDetailResponse detail = awaitJobFinished(summary.jobId());
 
-        assertThat(detail.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(detail.getBody()).isNotNull();
-        assertThat(detail.getBody().tasks()).hasSize(1);
-        assertThat(detail.getBody().tasks().get(0).seriesName()).isEqualTo("SERIES_ALPHA_001");
-        assertThat(detail.getBody().tasks().get(0).status()).isEqualTo("SUCCESS");
-        assertThat(detail.getBody().tasks().get(0).valuesSent()).isEqualTo(1);
+        assertThat(detail.status()).isEqualTo("COMPLETED");
+        assertThat(detail.tasks()).hasSize(1);
+        assertThat(detail.tasks().get(0).seriesName()).isEqualTo("SERIES_ALPHA_001");
+        assertThat(detail.tasks().get(0).status()).isEqualTo("SUCCESS");
+        assertThat(detail.tasks().get(0).valuesSent()).isEqualTo(1);
+    }
+
+    private JobDetailResponse awaitJobFinished(Long jobId) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (System.nanoTime() < deadline) {
+            ResponseEntity<JobDetailResponse> detail =
+                    restTemplate.getForEntity("/api/jobs/" + jobId, JobDetailResponse.class);
+            assertThat(detail.getStatusCode()).isEqualTo(HttpStatus.OK);
+            assertThat(detail.getBody()).isNotNull();
+            if (!"RUNNING".equals(detail.getBody().status())) {
+                return detail.getBody();
+            }
+            Thread.sleep(100);
+        }
+        throw new AssertionError("Job " + jobId + " still RUNNING after 30s");
     }
 
     @Test
@@ -133,22 +148,19 @@ class SyncControllerIT {
                         "asOfDate":"10/12/2026 6:00:00 PM",
                         "values":[{"startDate":"10/1/2026 12:00:00 AM","repeatedHour":false,"value":5.0}]}
                         """)));
-        // Deliberately slow so the first (synchronous) request is still RUNNING when we race it.
+        // Deliberately slow so the first job is still RUNNING when we race it.
         wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).willReturn(
                 okJson(LEDGERPOINT_SUCCESS_JSON).withFixedDelay(1500)));
 
         String url = "/api/series/typeB/sync?startDate=2026-10-01T00:00:00Z&endDate=2026-10-31T23:59:59Z";
 
-        CompletableFuture<ResponseEntity<JobSummaryResponse>> firstCall = CompletableFuture.supplyAsync(
-                () -> restTemplate.postForEntity(url, null, JobSummaryResponse.class));
-
-        Thread.sleep(300); // give the first call time to create the RUNNING job row
+        ResponseEntity<JobSummaryResponse> first = restTemplate.postForEntity(url, null, JobSummaryResponse.class);
+        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
 
         ResponseEntity<String> second = restTemplate.postForEntity(url, null, String.class);
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
 
-        ResponseEntity<JobSummaryResponse> first = firstCall.get(10, TimeUnit.SECONDS);
-        assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(awaitJobFinished(first.getBody().jobId()).status()).isEqualTo("COMPLETED");
     }
 }
 

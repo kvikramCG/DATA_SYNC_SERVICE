@@ -81,6 +81,10 @@ public class JobTaskChunkEntity {
         return orionCallCount;
     }
 
+    public void setOrionCallCount(int orionCallCount) {
+        this.orionCallCount = orionCallCount;
+    }
+
     public String getStatus() {
         return status;
     }

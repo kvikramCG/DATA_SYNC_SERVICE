@@ -19,8 +19,14 @@ public interface ChunkRepositoryPort {
      */
     Long createChunk(Long taskId, LocalDate chunkStart, LocalDate chunkEnd);
 
+    /** Records that the chunk reached an intermediate stage (counts are written by {@link #updateChunkStatus}). */
+    void markChunkStage(Long chunkId, ChunkStatus stage);
+
     void updateChunkStatus(Long chunkId, ChunkStatus status, int valuesFetched, int valuesNew,
                            int valuesUpdated, int valuesUnchanged, UUID ledgerPointBatchId);
+
+    /** Records how many HTTP calls were really made to Orion for this chunk (retries and token refreshes included). */
+    void updateOrionCallCount(Long chunkId, int orionCallCount);
 
     void recordWarning(Long chunkId, WarningType type, LocalDate intervalDate, String intervalNumber, String detail);
 }

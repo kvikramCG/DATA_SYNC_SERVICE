@@ -379,33 +379,30 @@ If `lastUpdatedDate` is older than **N days** (configurable, default `5`), mark 
 | `seriesName` | string | Sync just one series |
 | `startDate` / `endDate` | ISO-8601 instant, e.g. `2026-01-01T00:00:00Z` | Override the computed window |
 
-**Response `200 OK`**
+**Response `202 Accepted`** (the job runs in the background; poll `GET /api/jobs/{jobId}` for the outcome, see §7.2)
+
+Headers: `Location: /api/jobs/1042`
 ```json
 {
   "jobId": 1042,
   "seriesType": "typeA",
-  "status": "COMPLETED_WITH_FAILURES",
+  "status": "RUNNING",
   "startedAt": "2026-10-13T06:00:00Z",
-  "finishedAt": "2026-10-13T06:04:12Z",
-  "taskCounts": {
-    "SUCCESS": 41,
-    "SUCCESS_WITH_WARNINGS": 2,
-    "SKIPPED": 3,
-    "FAILED": 1
-  }
+  "finishedAt": null,
+  "taskCounts": {}
 }
 ```
 
 | Status | Meaning |
 |---|---|
-| 200 | Job ran (check `status` / `taskCounts`) |
+| 202 | Job created and started; poll `GET /api/jobs/{jobId}` until `status` leaves `RUNNING` |
 | 400 | Invalid type or date range (`startDate` > `endDate`) |
 | 409 | A job for this series type is already running |
 | 500 | Unexpected failure before job creation |
 
 ### 7.2 Get job details
 
-`GET /api/jobs/{jobId}`
+`GET /api/jobs/{jobId}` - `status` is `RUNNING` until every task finishes, then `COMPLETED`, `COMPLETED_WITH_FAILURES` or `FAILED`.
 
 ```json
 {
@@ -447,6 +444,7 @@ If `lastUpdatedDate` is older than **N days** (configurable, default `5`), mark 
 | `TARGET_REJECTED` | LedgerPoint returned 400 |
 | `UNKNOWN_SERIES` | LedgerPoint returned 409 |
 | `TARGET_UNAVAILABLE` | LedgerPoint retries exhausted |
+| `INTERNAL_ERROR` | Unexpected failure inside this service (implementation addition, so a Task is never left `PENDING`) |
 
 ---
 

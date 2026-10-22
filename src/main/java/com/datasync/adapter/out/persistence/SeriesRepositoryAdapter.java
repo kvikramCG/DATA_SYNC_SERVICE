@@ -1,5 +1,6 @@
 package com.datasync.adapter.out.persistence;
 
+import com.datasync.domain.exception.UnsupportedTimeZoneException;
 import com.datasync.domain.model.SeriesDescriptor;
 import com.datasync.domain.model.SeriesType;
 import com.datasync.domain.model.TimeZoneCode;
@@ -39,15 +40,17 @@ public class SeriesRepositoryAdapter implements SeriesRepositoryPort {
                     .orElseGet(() -> new SeriesEntity(
                             descriptor.name(),
                             descriptor.type().wireValue(),
-                            descriptor.timeZone().orionCode(),
+                            descriptor.orionTimeZoneCode(),
                             now,
                             now));
 
+            entity.setTimeZoneCode(descriptor.orionTimeZoneCode());
             entity.setEarliestDataDate(descriptor.earliestDataDate() == null
                     ? null : descriptor.earliestDataDate().toLocalDate());
             entity.setLatestDataDate(descriptor.latestDataDate() == null
                     ? null : descriptor.latestDataDate().toLocalDate());
-            entity.setLastUpdatedDate(descriptor.lastUpdatedDate() == null
+            // Without a supported timezone the local timestamp cannot be turned into an instant.
+            entity.setLastUpdatedDate(descriptor.lastUpdatedDate() == null || descriptor.timeZone() == null
                     ? null : descriptor.lastUpdatedDate().atZone(ZoneId.of(descriptor.timeZone().ianaZoneId())).toInstant());
             entity.setUpdatedAt(now);
 
@@ -74,9 +77,27 @@ public class SeriesRepositoryAdapter implements SeriesRepositoryPort {
         repository.save(entity);
     }
 
+    @Override
+    @Transactional
+    public void updateUnit(Long seriesId, String unit) {
+        SeriesEntity entity = repository.findById(seriesId)
+                .orElseThrow(() -> new IllegalArgumentException("No series found with id " + seriesId));
+        if (java.util.Objects.equals(entity.getUnit(), unit)) {
+            return;
+        }
+        entity.setUnit(unit);
+        entity.setUpdatedAt(clock.now());
+        repository.save(entity);
+    }
+
     private SeriesDescriptor toDomain(SeriesEntity entity) {
-        TimeZoneCode timeZone = TimeZoneCode.fromOrionCode(entity.getTimeZoneCode());
-        LocalDateTime lastUpdated = entity.getLastUpdatedDate() == null
+        TimeZoneCode timeZone;
+        try {
+            timeZone = TimeZoneCode.fromOrionCode(entity.getTimeZoneCode());
+        } catch (UnsupportedTimeZoneException ex) {
+            timeZone = null; // surfaces later as a Task failure with UNSUPPORTED_TIMEZONE (spec 6.2)
+        }
+        LocalDateTime lastUpdated = entity.getLastUpdatedDate() == null || timeZone == null
                 ? null
                 : LocalDateTime.ofInstant(entity.getLastUpdatedDate(), ZoneId.of(timeZone.ianaZoneId()));
         return new SeriesDescriptor(
@@ -87,6 +108,7 @@ public class SeriesRepositoryAdapter implements SeriesRepositoryPort {
                 lastUpdated,
                 entity.getEarliestDataDate() == null ? null : entity.getEarliestDataDate().atStartOfDay(),
                 entity.getLatestDataDate() == null ? null : entity.getLatestDataDate().atStartOfDay(),
-                entity.getLastSyncedDate());
+                entity.getLastSyncedDate(),
+                entity.getTimeZoneCode());
     }
 }

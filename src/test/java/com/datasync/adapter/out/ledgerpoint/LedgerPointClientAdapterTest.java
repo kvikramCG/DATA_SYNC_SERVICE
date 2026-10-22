@@ -12,6 +12,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -45,6 +46,7 @@ class LedgerPointClientAdapterTest {
     private LedgerPointProperties properties;
     private RestClient restClient;
     private UUID correlationId;
+    private SimpleMeterRegistry meterRegistry;
 
     @BeforeEach
     void setUp() {
@@ -63,6 +65,12 @@ class LedgerPointClientAdapterTest {
         restClient = RestClient.builder().baseUrl(properties.getBaseUrl()).requestFactory(factory).build();
 
         correlationId = UUID.randomUUID();
+        meterRegistry = new SimpleMeterRegistry();
+    }
+
+    private double ledgerPointRequests(String outcome) {
+        var counter = meterRegistry.find(LedgerPointClientAdapter.REQUESTS_METRIC).tag("outcome", outcome).counter();
+        return counter == null ? 0 : counter.count();
     }
 
     @AfterEach
@@ -77,7 +85,7 @@ class LedgerPointClientAdapterTest {
                 .waitDuration(Duration.ofMillis(10))
                 .retryExceptions(LedgerPointTransientException.class)
                 .build());
-        return new LedgerPointClientAdapter(restClient, properties, new ObjectMapper(), retryRegistry);
+        return new LedgerPointClientAdapter(restClient, properties, new ObjectMapper(), retryRegistry, meterRegistry);
     }
 
     private ClassifiedSeriesValue classified(String value, ChangeType type) {
@@ -157,6 +165,50 @@ class LedgerPointClientAdapterTest {
                 "SERIES_ALPHA_001", "U1", "TZ_C", List.of(classified("31.25", ChangeType.UPDATED)), correlationId);
 
         assertThat(result.updated()).isEqualTo(1);
+    }
+
+    @Test
+    void sendsValuesAsPlainDecimalStringsNeverScientificNotation() {
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).willReturn(okJson("""
+                {"batchId":"f7c1e2a4-1b2c-4d5e-9f00-1234567890ab","received":1,"inserted":1,"updated":0}
+                """)));
+
+        adapter(10_000).publish("SERIES_ALPHA_001", "U1", "TZ_C",
+                List.of(classified("1E+3", ChangeType.NEW)), correlationId);
+
+        wireMockServer.verify(postRequestedFor(urlEqualTo("/api/v2/series/values"))
+                .withRequestBody(com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath(
+                        "$[0].value", com.github.tomakehurst.wiremock.client.WireMock.equalTo("1000"))));
+    }
+
+    @Test
+    void requestOutcomesAreCounted() {
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("metrics")
+                .whenScenarioStateIs(STARTED)
+                .willReturn(aResponse().withStatus(503))
+                .willSetStateTo("recovered"));
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("metrics")
+                .whenScenarioStateIs("recovered")
+                .willReturn(okJson("""
+                        {"batchId":"f7c1e2a4-1b2c-4d5e-9f00-1234567890ab","received":1,"inserted":1,"updated":0}
+                        """)));
+
+        adapter(10_000).publish("SERIES_ALPHA_001", "U1", "TZ_C",
+                List.of(classified("31.25", ChangeType.NEW)), correlationId);
+
+        assertThat(ledgerPointRequests("transient_error")).isEqualTo(1);
+        assertThat(ledgerPointRequests("success")).isEqualTo(1);
+    }
+
+    @Test
+    void authFailureIsCountedAsAuthFailed() {
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).willReturn(aResponse().withStatus(403)));
+
+        assertThatThrownBy(() -> adapter(10_000).publish(
+                "SERIES_ALPHA_001", "U1", "TZ_C", List.of(classified("31.25", ChangeType.NEW)), correlationId))
+                .isInstanceOf(LedgerPointAuthException.class);
+
+        assertThat(ledgerPointRequests("auth_failed")).isEqualTo(1);
     }
 
     @Test

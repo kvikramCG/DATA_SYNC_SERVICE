@@ -17,6 +17,10 @@ import java.time.LocalDateTime;
  * <p>{@code lastSyncedDate} is the service's own high-watermark (spec &sect;3.1) - {@code null}
  * means the series has never been successfully synced, in which case window resolution falls
  * back to "1 year prior to today".
+ *
+ * <p>{@code timeZone} is {@code null} when Orion reported a timezone code this service does not
+ * support (spec &sect;6.2); {@code orionTimeZoneCode} then still carries the raw code so the Task
+ * can fail with {@code UNSUPPORTED_TIMEZONE} and a useful detail message.
  */
 public record SeriesDescriptor(
         Long id,
@@ -26,6 +30,15 @@ public record SeriesDescriptor(
         LocalDateTime lastUpdatedDate,
         LocalDateTime earliestDataDate,
         LocalDateTime latestDataDate,
-        LocalDate lastSyncedDate
+        LocalDate lastSyncedDate,
+        int orionTimeZoneCode
 ) {
+
+    /** Convenience constructor for series with a supported timezone. */
+    public SeriesDescriptor(Long id, String name, SeriesType type, TimeZoneCode timeZone,
+                             LocalDateTime lastUpdatedDate, LocalDateTime earliestDataDate,
+                             LocalDateTime latestDataDate, LocalDate lastSyncedDate) {
+        this(id, name, type, timeZone, lastUpdatedDate, earliestDataDate, latestDataDate, lastSyncedDate,
+                timeZone == null ? 0 : timeZone.orionCode());
+    }
 }

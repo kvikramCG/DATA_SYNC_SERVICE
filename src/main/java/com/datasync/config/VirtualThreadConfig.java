@@ -22,9 +22,9 @@ public class VirtualThreadConfig {
     }
 
     /**
-     * Raw executor used by {@code SyncOrchestrationService} via {@code invokeAll} to run every
-     * series Task of a job concurrently and block until all finish (the HTTP trigger is
-     * synchronous per spec &sect;7.1).
+     * Raw executor used by {@code SyncOrchestrationService} to run each job in the background
+     * and, via {@code invokeAll}, every series Task of that job concurrently (the HTTP trigger
+     * is asynchronous: 202 Accepted, then poll {@code GET /api/jobs/{id}}).
      */
     @Bean(destroyMethod = "shutdown")
     public ExecutorService virtualThreadExecutor() {

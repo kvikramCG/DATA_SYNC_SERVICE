@@ -18,6 +18,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.resilience4j.decorators.Decorators;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryRegistry;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatusCode;
@@ -42,19 +43,24 @@ public class LedgerPointClientAdapter implements SeriesPublisherPort {
 
     private static final Logger log = LoggerFactory.getLogger(LedgerPointClientAdapter.class);
 
+    static final String REQUESTS_METRIC = "datasync.ledgerpoint.requests";
+
     private final RestClient ledgerPointRestClient;
     private final LedgerPointProperties properties;
     private final ObjectMapper objectMapper;
     private final Retry retry;
+    private final MeterRegistry meterRegistry;
 
     public LedgerPointClientAdapter(RestClient ledgerPointRestClient,
                                      LedgerPointProperties properties,
                                      ObjectMapper objectMapper,
-                                     RetryRegistry retryRegistry) {
+                                     RetryRegistry retryRegistry,
+                                     MeterRegistry meterRegistry) {
         this.ledgerPointRestClient = ledgerPointRestClient;
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.retry = retryRegistry.retry("ledgerpoint");
+        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -97,6 +103,7 @@ public class LedgerPointClientAdapter implements SeriesPublisherPort {
                 batch.stream().map(ClassifiedSeriesValue::changeType).toList(), key, unitCode, timeZoneCode);
         log.debug("Publishing LedgerPoint batch {} ({} rows)", label, rows.size());
 
+        String outcome = "success";
         try {
             return ledgerPointRestClient.post()
                     .uri("/api/v2/series/values")
@@ -118,8 +125,23 @@ public class LedgerPointClientAdapter implements SeriesPublisherPort {
                         throw new LedgerPointTransientException("LedgerPoint transient error: " + res.getStatusCode());
                     })
                     .body(LedgerPointBatchResponseDto.class);
+        } catch (LedgerPointAuthException e) {
+            outcome = "auth_failed";
+            throw e;
+        } catch (LedgerPointUnknownSeriesException e) {
+            outcome = "unknown_series";
+            throw e;
+        } catch (LedgerPointValidationException e) {
+            outcome = "validation_error";
+            throw e;
+        } catch (LedgerPointTransientException e) {
+            outcome = "transient_error";
+            throw e;
         } catch (ResourceAccessException networkException) {
+            outcome = "transient_error";
             throw new LedgerPointTransientException("LedgerPoint network error: " + networkException.getMessage());
+        } finally {
+            meterRegistry.counter(REQUESTS_METRIC, "outcome", outcome).increment();
         }
     }
 

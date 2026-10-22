@@ -1,0 +1,550 @@
+====================================================================================================
+DATA SYNC SERVICE - ARCHITECT REVIEW
+Orion -> Data Sync Service -> LedgerPoint
+====================================================================================================
+
+Prepared from : README.md, Data_Sync_POC_Specification.md, architecture.md, database-design.md,
+                plan.md, pom.xml, application.yml, V1__init_schema.sql and the Java source tree
+                under src/main and src/test.
+Review type   : Read-only. No source code was changed.
+Date          : 2026-10-16
+
+Contents
+  1. What the system is (requirements in one page)
+  2. Docs vs actual Java project - comparison
+  3. Findings: gaps, inconsistencies and risks (ranked)
+  4. Clean ADR list (for presentation / review)
+  5. Why a Monolith and not Microservices (detailed)
+  6. Recommended next steps
+
+
+====================================================================================================
+1. WHAT THE SYSTEM IS
+====================================================================================================
+
+Purpose
+  Fetch time-series values from Orion (source), transform and validate them, and push only the
+  changed values to LedgerPoint (target). Every run is tracked as a Job with one Task per series.
+
+Flow per series (spec 3.1)
+  Resolve date window -> chunk by calendar month -> fetch from Orion -> parse dates / convert to
+  UTC -> DST adjustment -> interval assignment -> unit mapping -> change detection (NEW / UPDATED /
+  UNCHANGED) -> publish NEW+UPDATED to LedgerPoint -> persist only after LedgerPoint accepts ->
+  update Task status.
+
+External constraints that drive the architecture
+  Orion        : bearer token (60 min), 5 requests/second, 429 + Retry-After, date format
+                 "M/d/yyyy h:mm:ss a" in prevailing local time.
+  LedgerPoint  : X-Api-Key, max 10,000 rows per request, upsert on (key, date, interval),
+                 400 (reject, no retry), 409 (unknown series), 401/403 (fail the Job), 5xx (retry).
+
+Business rules that carry the most risk
+  - DST: fall-back day has 25 hours (repeated hour -> interval "2x"); spring-forward day has
+    23 hours (missing hour filled from previous interval, never an "x").
+  - Intervals: daily=1, hourly=1..24, 15-min=1..96.
+  - Change detection key: (series, startInstant, repeatedHour), tolerance 1e-9.
+  - Gap rule: do not invent data; warn and finish as SUCCESS_WITH_WARNINGS.
+  - Staleness rule: lastUpdatedDate older than N days (default 5) -> FAILED / STALE_SERIES.
+  - Isolation: one failed series must never stop the Job.
+  - Idempotency: re-running the same window sends 0 values.
+
+API exposed
+  POST /api/series/{seriesType}/sync   (409 if a job for that type is already running)
+  GET  /api/jobs/{jobId}
+
+Acceptance criteria: 13 items in spec section 11 (mock Orion/LedgerPoint with WireMock).
+
+
+====================================================================================================
+2. DOCS vs ACTUAL JAVA PROJECT
+====================================================================================================
+
+Legend:  MATCH = code agrees with docs | PARTIAL = built but differs | NOT BUILT = documented only
+
+2.1 Technology stack
+  Item                              Docs                               Code                         Result
+  --------------------------------  ---------------------------------  ---------------------------  -------
+  Language / framework              Java 21, Spring Boot 3.x, Maven    Java 21, Boot 3.3.4, Maven   MATCH
+  Single Maven module               yes                                yes (one pom.xml)            MATCH
+  Database                          PostgreSQL + TimescaleDB           postgres driver + Flyway     MATCH
+                                                                       + create_hypertable
+  Migrations                        Flyway                             V1__init_schema.sql          MATCH
+  HTTP client                       Spring RestClient (blocking)       RestClientConfig, 2 beans    MATCH
+  Parallelism                       Virtual threads, 1 per Task        VirtualThreadConfig +        MATCH
+                                                                       invokeAll
+  Rate limit / retry                Resilience4j, 5 rps, 3 tries,      application.yml              MATCH
+                                    300 ms exponential
+  Test DB                           Spec suggests H2                   Testcontainers TimescaleDB   DEVIATION
+                                                                                                    (justified:
+                                                                                                    H2 cannot run
+                                                                                                    hypertables)
+  Observability stack               Prometheus, OpenTelemetry,         Actuator exposes only        NOT BUILT
+                                    Grafana, CloudWatch                health,info; no Micrometer
+                                                                       registry; only a
+                                                                       CorrelationIdFilter
+
+2.2 Package / module structure
+  architecture.md lists capability modules:
+    api, scheduler, job-engine, sync-engine, orion-client, ledgerpoint-client,
+    transformation-engine, dst-engine, interval-engine, diff-engine, persistence,
+    rules-engine, observability, common
+
+  The code is organised by hexagonal LAYER, not by those capability modules:
+    com.datasync.domain.model          records and enums (Job, JobTask, SeriesDescriptor, ...)
+    com.datasync.domain.service        pure logic: DstAdjustmentService, IntervalAssigner, UnitMapper,
+                                       ChangeDetector, GapDetector, MonthChunker, BatchSplitter,
+                                       BatchLabelBuilder
+    com.datasync.domain.port.in        TriggerSyncUseCase, GetJobUseCase, RefreshSeriesCatalogUseCase
+    com.datasync.domain.port.out       SeriesSourcePort, SeriesPublisherPort, JobRepositoryPort,
+                                       TaskRepositoryPort, SeriesRepositoryPort, SeriesValuePort,
+                                       ChunkRepositoryPort, ClockPort
+    com.datasync.domain.exception      Orion*/LedgerPoint*/Job* exceptions
+    com.datasync.application           SyncOrchestrationService, SeriesSyncWorker,
+                                       SeriesCatalogService, TaskOutcome
+    com.datasync.adapter.in.web        SyncController, JobController, GlobalExceptionHandler,
+                                       CorrelationIdFilter, response DTOs
+    com.datasync.adapter.out.orion     OrionClientAdapter, OrionTokenCache, DTOs
+    com.datasync.adapter.out.ledgerpoint LedgerPointClientAdapter, DTOs
+    com.datasync.adapter.out.persistence JPA entities, Spring Data repos, *RepositoryAdapter
+    com.datasync.adapter.out.clock     SystemClockAdapter
+    com.datasync.config                RestClientConfig, VirtualThreadConfig
+
+  Mapping of documented modules to code:
+    api                    -> adapter.in.web                                  PARTIAL (renamed)
+    job-engine             -> application.SyncOrchestrationService            PARTIAL (merged)
+    sync-engine            -> application.SeriesSyncWorker                    PARTIAL (merged)
+    orion-client           -> adapter.out.orion                               MATCH (renamed)
+    ledgerpoint-client     -> adapter.out.ledgerpoint                         MATCH (renamed)
+    transformation/dst/
+    interval/diff engines  -> domain.service                                  MATCH (one package)
+    persistence            -> adapter.out.persistence                         MATCH
+    rules-engine           -> nothing                                         NOT BUILT
+    scheduler              -> nothing                                         NOT BUILT (POC: manual only)
+    observability          -> CorrelationIdFilter only                        PARTIAL
+    common                 -> domain.exception / config                       PARTIAL
+
+  Architect's reading: ADR-002 says "package structure per capability, so extraction is easy".
+  The implemented structure is a single hexagon with layer packages. That is a good structure for
+  a monolith and the dependency rules are enforced by ArchUnit, but it is NOT the same as
+  capability modules. If extraction is ever needed, orion-client and ledgerpoint-client are already
+  cleanly extractable (they sit behind ports); the rest would need to be regrouped. The docs
+  should state this honestly (see finding F-9).
+
+2.3 Ports and hexagonal rules
+  Documented outbound ports : SeriesSourcePort, SeriesPublisherPort, JobRepositoryPort,
+                              SeriesRepositoryPort, SeriesValuePort, RuleOverrideRepositoryPort,
+                              ClockPort
+  Implemented               : all of the above EXCEPT RuleOverrideRepositoryPort; plus two ports
+                              the docs did not list: TaskRepositoryPort, ChunkRepositoryPort.
+  Documented inbound ports  : TriggerSyncUseCase, GetJobUseCase  -> MATCH (+ RefreshSeriesCatalogUseCase)
+  ArchUnit enforcement      : HexagonalArchitectureTest - domain !-> adapter, domain !-> Spring/JPA,
+                              application !-> adapter. MATCH with ADR-003.
+                              Not enforced: adapter.in must not depend on adapter.out (and vice versa).
+
+2.4 Database schema (database-design.md vs V1__init_schema.sql)
+  All 7 tables, the unique partial index uq_job_running_per_type, uq_chunk_task_start, the
+  series_value primary key (series_id, start_instant, repeated_hour) and the hypertable
+  (1 month chunks, no compression) match the design doc exactly.
+  Removed vs original architecture draft: sync_checkpoint (merged into series.last_synced_date),
+  job_execution_log (replaced by structured logs). Added: job_task_chunk. MATCH.
+
+2.5 Functional requirement status (spec vs code)
+  Requirement                                   Status
+  --------------------------------------------  ---------------------------------------------------
+  Trigger sync + job/task tracking              BUILT  (SyncController, SyncOrchestrationService)
+  GET job details                               BUILT  (JobController)
+  Window resolution + month chunking            BUILT  (resolveWindow, MonthChunker)
+  Orion token cache, refresh on 401, retry      BUILT  (OrionTokenCache, OrionClientAdapter)
+  Global 5 rps limiter                          BUILT  (Resilience4j "orion", shared by all threads)
+  Honor Retry-After on 429                      NOT BUILT (no "Retry-After" handling in src/main)
+  DST fall-back / spring-forward                BUILT  (DstAdjustmentService, uses java.time rules)
+  Interval assignment, unit mapping             BUILT
+  Change detection NEW/UPDATED/UNCHANGED        BUILT  (ChangeDetector + SeriesValuePort)
+  Batch split at 10,000, batch label            BUILT  (BatchSplitter, BatchLabelBuilder)
+  Publish-then-persist                          BUILT  (SeriesSyncWorker.processChunk)
+  Gap detection + SUCCESS_WITH_WARNINGS         BUILT  (GapDetector, task_warning)
+  Per-month chunk audit rows                    BUILT  (job_task_chunk)
+  DB unique-index job lock -> HTTP 409          BUILT  (JobRepositoryAdapter + GlobalExceptionHandler)
+  series_rule_override (key override / SKIPPED) NOT BUILT (table exists, nothing reads it) - roadmap #11
+  Staleness check (STALE_SERIES)                NOT BUILT (FailureReason exists, no check)   - roadmap #12
+  Scheduler (cron)                              NOT BUILT (explicitly out of POC scope)
+  Metrics (Prometheus etc.)                     NOT BUILT
+  Acceptance-criteria test suite (spec 11)      PARTIAL  (unit/IT tests exist; criteria 8, 9, 11
+                                                          and 13 not fully covered; roadmap #13)
+
+2.6 Doc-to-doc inconsistencies
+  - database-design.md section 5, criterion 4 says a DST_SPRING_FORWARD_FILLED task_warning is
+    recorded. The code does not emit it (WarningType values DST_SPRING_FORWARD_FILLED and
+    DST_FALL_BACK_REPEATED exist but are unused; plan.md Slice 8 decided DST adjustments are NOT
+    warnings, only genuine data gaps are, per spec 6.4 / 6.8).  Doc must be corrected.
+  - database-design.md defines chunk statuses FETCHED / TRANSFORMED / PUBLISHED / PERSISTED / FAILED.
+    The code only ever writes PERSISTED or FAILED.
+  - plan.md "Relevant files" still points to d:\poc_vs\... (old location).
+  - architecture.md is still "Version 1.0" and has no section describing what is implemented;
+    that information lives only in plan.md.
+  - README.md is two lines.
+  - architecture.md ADR-003 says hexagonal is applied "within each module"; code applies it once
+    for the whole application.
+
+
+====================================================================================================
+3. FINDINGS: GAPS AND RISKS (ranked by severity)
+====================================================================================================
+
+These were found by reading the source. Each should be verified with a test before any fix.
+
+F-1  [HIGH]  A Job can be left RUNNING forever and then block that series type permanently.
+  Where : SyncOrchestrationService.triggerSync
+  Why   : createRunningJob() inserts the RUNNING row first. Everything after it (refreshCatalog,
+          creating tasks, runTasksConcurrently) has no try/finally. If refreshCatalog throws
+          (for example OrionAuthException or OrionTransientException on the list call) or any
+          unexpected exception escapes, markJobFinished is never called. The unique partial index
+          then returns 409 for every later trigger of that series type. The same happens if the
+          process is killed mid-job.
+  Note  : architecture.md presents "survives process restarts" as a benefit of the DB lock. It is
+          also the failure mode - there is no recovery for an orphaned RUNNING row.
+  Fix direction: wrap the post-creation work in try/catch -> mark job FAILED; add a startup /
+          scheduled "stale RUNNING job reaper" (job RUNNING longer than a configured max).
+
+F-2  [HIGH]  A Task can be left PENDING if the Orion rate limiter times out.
+  Where : application.yml (ratelimiter timeout-duration 10s) + SeriesSyncWorker.process
+  Why   : With 5 permits/second and a 10 s wait, only about 50 calls can be queued. A job with many
+          series x many months starts all Tasks at once on virtual threads. Threads that wait more
+          than 10 s get RequestNotPermitted. SeriesSyncWorker.process() does not catch it (it is
+          only mapped in the web GlobalExceptionHandler). The exception propagates out of the
+          Callable, SyncOrchestrationService logs "Unexpected failure", and the Task stays PENDING
+          while the Job can still finish as COMPLETED.
+  Fix direction: either map RequestNotPermitted to a Task failure (SOURCE_UNAVAILABLE) or, better,
+          size timeout-duration for the largest expected job (or bound concurrency with a
+          semaphore) so queued threads wait instead of failing.
+
+F-3  [HIGH]  last_synced_date may skip data not yet published by Orion.
+  Where : SeriesSyncWorker.processInternal -> updateLastSyncedDate(series.id(), windowEnd)
+  Why   : windowEnd has been normalized to the LAST DAY OF THE MONTH (spec 3.1 step 1). If
+          latestDataDate is 10/13, windowEnd is 10/31 and last_synced_date is stored as 10/31.
+          The next run starts at 10/31, so values for 10/14 - 10/30 that Orion publishes later are
+          never requested (unless the caller supplies a start date).
+  Fix direction: store min(windowEnd, latestDataDate) or the date of the last value actually
+          received. Confirm intended semantics against the spec author.
+
+F-4  [MEDIUM] Orion 429 "Retry-After" is documented as honored but is not implemented.
+  Where : OrionClientAdapter (no Retry-After handling); architecture.md section 16 and spec section 8.
+  Why   : Retry uses fixed exponential backoff only. Impact is limited because the client-side
+          limiter already stays within 5 rps, but acceptance criterion 8 ("service waits and
+          retries") is only satisfied by backoff, not by the header.
+
+F-5  [MEDIUM] Staleness check and rule overrides are not built.
+  Acceptance criterion 11 (stale series) cannot pass. SKIPPED status is unreachable.
+  Both are known and tracked as roadmap items 11 and 12 in plan.md.
+
+F-6  [MEDIUM] "Fail Job immediately" on LedgerPoint 401/403 is not immediate.
+  Where : SyncOrchestrationService.runTasksConcurrently uses invokeAll, which waits for ALL tasks.
+  Why   : Other Tasks keep calling LedgerPoint with a bad key until they finish. Result is correct
+          (Job = FAILED) but the other Tasks do wasted, failing work.
+  Fix direction: shared cancellation flag, or ExecutorService.invokeAny / structured concurrency.
+
+F-7  [MEDIUM] The trigger endpoint is synchronous and long-running.
+  The spec asks for a synchronous 200 with taskCounts, and the code follows it. For a large Job
+  (many series x years of monthly chunks at 5 rps) the HTTP request can exceed gateway / client
+  timeouts (API Gateway is in the target AWS design - its integration timeout is far shorter than
+  a big job). Recommended future change: 202 Accepted + poll GET /api/jobs/{id}. This does not
+  require microservices; it only changes the trigger contract.
+
+F-8  [LOW]    Observability documented, not implemented.
+  architecture.md section 20 lists job / Orion / LedgerPoint / business metrics. Only correlation
+  id logging exists. Add Micrometer counters and a Prometheus endpoint when the pipeline is stable.
+
+F-9  [LOW]    Documentation drift (see 2.2 and 2.6). The ADR-002 module list and the implemented
+  layer packages should be reconciled so reviewers are not misled.
+
+F-10 [LOW]    ArchUnit gap. Add rules: adapter.in must not depend on adapter.out; adapters must not
+  depend on application internals; application must not use JPA types.
+
+F-11 [INFO]   Test status. plan.md states that Slices 3-8 have not yet been compiled/tested by the
+  user and that the Testcontainers ITs need Docker. Treat the implementation as "written, not yet
+  proven" until a full "mvn test" run is shown.
+
+
+====================================================================================================
+4. CLEAN ADR LIST
+====================================================================================================
+
+Format: Status | Context | Decision | Why | Consequences / Trade-offs
+"Documented" = already an ADR in architecture.md. "Derived" = decision visible in plan.md/code but
+not yet written as an ADR (recommend adding).
+
+----------------------------------------------------------------------------------------------------
+ADR-001  Modular Monolith instead of Microservices                              [Documented]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted (POC)
+Context       : Two external systems we do not control; Orion is capped at 5 req/s; LedgerPoint at
+                10,000 rows/request. The workflow (fetch, transform, DST, diff, publish, persist) is
+                one tightly coupled business transaction. POC priority is delivery speed.
+Decision      : One deployable Spring Boot application with enforced internal boundaries.
+Why           : Throughput is limited externally, so splitting internally gains no speed; single
+                process gives simple debugging, simple transactions, one deployment, low cost.
+Consequences  : + fastest delivery, + no distributed failures. - one scaling unit, - shared blast
+                radius, - needs discipline (ArchUnit) to keep boundaries. See section 5.
+
+----------------------------------------------------------------------------------------------------
+ADR-002  Design for Future Microservice Evolution                               [Documented]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted - partially realised
+Decision      : Keep capability boundaries clean so parts can be extracted later.
+Reality check : Implemented as layer packages (domain / application / adapter), not capability
+                modules. The two integration adapters are extractable today; the rest would need
+                regrouping. Update the ADR to describe the real structure.
+
+----------------------------------------------------------------------------------------------------
+ADR-003  Hexagonal Architecture (Ports and Adapters)                            [Documented]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted, implemented, enforced by HexagonalArchitectureTest
+Context       : DST / interval / diff logic is the riskiest code and has no need for Spring/HTTP/SQL.
+Decision      : Framework-free domain core; inbound ports = use cases; outbound ports = Orion,
+                LedgerPoint, repositories, clock; adapters implement the ports.
+Why           : Domain testable with plain JUnit; WireMock = swap the outbound adapter; makes ADR-002
+                credible.
+Trade-off     : More interfaces/mapping. Mitigated by applying rigor to the domain and the two
+                integrations only.
+
+----------------------------------------------------------------------------------------------------
+ADR-004  Virtual Threads instead of a Reactive Stack                            [Documented]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted, implemented (VirtualThreadConfig, invokeAll)
+Decision      : One Java 21 virtual thread per series Task, blocking RestClient, one shared
+                Resilience4j RateLimiter (5/s) and Retry (3 tries, 300 ms exponential).
+Why           : The ceiling is external; non-blocking I/O cannot raise it. Blocking code is simpler
+                to write, debug and test and maps 1:1 to "one Task".
+Consequence   : Risk F-2 (limiter wait timeout) must be sized correctly.
+
+----------------------------------------------------------------------------------------------------
+ADR-005  PostgreSQL + TimescaleDB, minimally scoped                              [Documented (section 9)]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted, implemented
+Decision      : TimescaleDB as a Postgres extension; exactly one hypertable (series_value,
+                1-month chunks); no compression policy or continuous aggregates yet. Flyway for DDL.
+Why           : series_value is the only genuinely time-series table and grows with years x up to
+                96 intervals/day x N series. Zero extra SQL/JPA dialect cost; Testcontainers image
+                available.
+Consequence   : Production needs the extension available (RDS does not provide TimescaleDB; AWS
+                option is self-managed Postgres on EC2/ECS or Timescale Cloud). Verify against the
+                target AWS plan.
+
+----------------------------------------------------------------------------------------------------
+ADR-006  DB-level Job Lock (unique partial index)                                [Documented]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted, implemented
+Decision      : UNIQUE INDEX uq_job_running_per_type ON job(series_type) WHERE status='RUNNING'.
+                Insert the RUNNING row first; a unique violation becomes HTTP 409.
+Why           : Works across any number of instances, no Redis/ZooKeeper, lock is a visible row.
+Consequence   : Orphaned RUNNING rows block the type (finding F-1). Needs a reaper.
+
+----------------------------------------------------------------------------------------------------
+ADR-007  Publish first, then persist successful state                           [Documented (section 18)]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted, implemented
+Decision      : series_value represents values successfully synchronised, not merely fetched.
+                Rows are upserted only after LedgerPoint returns 200 for the chunk.
+Why           : Spec 8 "Partial months"; makes re-runs idempotent and diffing trustworthy. Replaces a
+                queue-first buffering design that suits telemetry platforms, not this contract.
+Consequence   : A crash between publish and persist re-sends the chunk next run - safe, because
+                LedgerPoint upserts on (key, date, interval).
+
+----------------------------------------------------------------------------------------------------
+ADR-008  Job / Task / Chunk execution model with failure isolation              [Derived]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted, implemented
+Decision      : Job (one run) -> Task (one series) -> Chunk (one calendar month) -> Warning.
+                A Task failure never stops the Job. Only LedgerPoint auth failure fails the Job.
+Why           : Operability and auditability: answers what / when / why failed / what changed.
+Consequence   : Status vocabularies fixed (JobStatus, TaskStatus, FailureReason, ChunkStatus).
+
+----------------------------------------------------------------------------------------------------
+ADR-009  Schema simplifications vs original draft                                [Documented in database-design.md]
+----------------------------------------------------------------------------------------------------
+Status        : Accepted, implemented
+Decision      : Drop sync_checkpoint (use series.last_synced_date); drop job_execution_log (use
+                structured JSON logs with jobId / seriesName / correlationId); add job_task_chunk.
+Why           : Avoid duplicated watermark and write amplification; gain per-month audit and resume.
+Consequence   : See finding F-3 about the value stored in last_synced_date.
+
+----------------------------------------------------------------------------------------------------
+ADR-010  Enums stored as varchar, not native Postgres enums                      [Documented]
+----------------------------------------------------------------------------------------------------
+Decision      : New status / failure-reason values need only an application change, no migration.
+
+----------------------------------------------------------------------------------------------------
+ADR-011  Resilience policy per external system                                   [Derived]
+----------------------------------------------------------------------------------------------------
+Decision      : Orion  = global rate limiter + retry on transient only, token refresh once on 401.
+                LedgerPoint = retry on 5xx/network only, NO rate limiter (none published), never
+                retry 400 / 409 / 401.
+Why           : Matches spec section 8 retry table. Exception types live in the domain so the
+                application layer can map them to FailureReasons without depending on adapters.
+
+----------------------------------------------------------------------------------------------------
+ADR-012  Pure, java.time-based DST / interval engine in the domain                [Derived]
+----------------------------------------------------------------------------------------------------
+Decision      : DstAdjustmentService uses ZoneRules (transitions) instead of hard-coding "2 AM";
+                interval assignment, unit mapping, change detection and gap detection are pure
+                static functions with no framework imports.
+Why           : Exactly reproducible with the spec section 12 fixtures; fastest tests.
+
+----------------------------------------------------------------------------------------------------
+ADR-013  Synchronous trigger endpoint                                            [Derived from spec 7.1]
+----------------------------------------------------------------------------------------------------
+Decision      : POST /sync blocks until the Job finishes and returns taskCounts.
+Consequence   : Acceptable for the POC; revisit (202 + polling) before production (finding F-7).
+
+----------------------------------------------------------------------------------------------------
+ADR-014  Test strategy: Testcontainers (TimescaleDB) + WireMock + ArchUnit      [Derived]
+----------------------------------------------------------------------------------------------------
+Decision      : Real TimescaleDB in integration tests instead of H2 (spec suggestion), WireMock for
+                Orion/LedgerPoint, ArchUnit for dependency rules, plain JUnit for the domain.
+Why           : H2 cannot host the hypertable; real behaviour is exercised.
+
+
+====================================================================================================
+5. WHY A MONOLITH AND NOT MICROSERVICES
+====================================================================================================
+
+5.1 The short answer
+  This system is a single, tightly coupled, batch workflow squeezed between two systems we do not
+  control, and its speed limit is set by those systems (Orion: 5 requests per second). Microservices
+  would add distributed-system cost (network, messaging, tracing, deployments, consistency) while
+  giving no extra throughput. A modular monolith delivers the same business result sooner, cheaper
+  and with fewer failure modes - and, because of the hexagonal ports, keeps the door open to split
+  later when there is a real reason.
+
+5.2 Reason 1 - The bottleneck is external, so splitting does not make it faster
+  Orion allows 5 requests/second per client. Fifty copies of a fetch microservice still cannot
+  exceed 5 requests/second to Orion; they would only need a shared, distributed rate limiter to stay
+  legal. LedgerPoint accepts 10,000 rows per request, which is a payload-size rule, not a
+  concurrency rule. Internal decomposition therefore buys no throughput. The only useful
+  parallelism is across series, and Java 21 virtual threads provide that inside one process.
+
+5.3 Reason 2 - The workflow is one coupled business transaction
+  Resolve window -> fetch -> convert -> DST -> interval -> map units -> diff -> publish -> persist.
+  Each step consumes the previous step's output and the whole chain must succeed per chunk. In a
+  microservice design this chain becomes:
+        Fetch service -> Kafka -> Transform service -> Kafka -> Diff service -> Kafka -> Publisher
+  Now every hop needs a contract, serialisation, retries, dead-letter handling and idempotency, and
+  "what happened to month X of series Y?" becomes a distributed tracing exercise. In the monolith
+  it is a method call and a stack trace.
+
+5.3.1 Consistency (the strongest technical argument)
+  The spec requires "publish THEN persist" (ADR-007) per chunk. The service must know a chunk was
+  accepted before recording it as synced, and must compare against the same store it writes to.
+  Inside one process and one database this is simple and reliable. Across services it requires
+  sagas, outbox patterns or two-phase commit, and eventual consistency makes the "re-run sends 0
+  values" acceptance criterion much harder to guarantee.
+
+5.4 Reason 3 - Concurrency control is trivial in one database
+  One-running-job-per-type is solved by a single unique partial index on the job table (ADR-006).
+  With microservices the same rule needs a distributed lock (Redis, ZooKeeper, etc.) and fencing,
+  adding infrastructure and new failure cases.
+
+5.5 Reason 4 - Cost, operations and delivery speed for a POC
+  Item                         Modular monolith               Microservices
+  ---------------------------  -----------------------------  -----------------------------------------
+  Deployables                  1                              4-6 (fetch, transform, publish, jobs, api)
+  Messaging                    none                           Kafka / SQS cluster + schemas
+  Service discovery / mesh     none                           required
+  Distributed tracing          nice to have                   mandatory
+  CI/CD pipelines              1                              one per service
+  Local development            run one app + 1 DB container   compose of many services + broker
+  Debugging                    one stack trace                correlate logs across services
+  Failure modes                process or DB down             + network, broker, partial delivery,
+                                                              version skew, duplicate messages
+  Time to first working sync   shortest                       longest
+  AWS footprint                ECS Fargate task + DB          multiple tasks + broker + networking
+
+  The project already carries a lot of genuine complexity (DST, intervals, change detection,
+  rate limiting). Adding distribution on top competes for the same team's attention.
+
+5.6 Reason 5 - Observability and testing are simpler
+  - Correlation id propagation is one servlet filter plus MDC, not a cross-service convention.
+  - The 13 acceptance criteria are written against a mocked Orion and a mocked LedgerPoint.
+    A monolith needs only two WireMock servers; microservices would need a full environment.
+  - The riskiest logic (DST, intervals, diff) is plain Java, tested in milliseconds.
+
+5.7 Reason 6 - Team and ownership
+  One team owns the whole pipeline. Microservices pay off when different teams own different
+  components and must deploy independently (Conway's law). That condition does not exist here.
+
+5.8 Reason 7 - Scaling model does not need independent scaling yet
+  Scaling is capped by Orion. Horizontal scale of the application (several ECS tasks) is still
+  possible and safe, because job locking lives in the database. If the Publisher ever needs to be
+  "100x larger than fetch", that is a real trigger to split - but nothing today indicates it.
+
+5.9 Honest downsides of the monolith (and how this project mitigates them)
+  Downside                                   Mitigation in this project
+  -----------------------------------------  ------------------------------------------------------
+  Boundaries erode over time                 ArchUnit rules (HexagonalArchitectureTest); extend them
+                                             (finding F-10)
+  One scaling unit / shared blast radius     Per-Task failure isolation; DB lock; stateless app so
+                                             several instances can run
+  A heavy job can tie up the one process     Virtual threads are cheap; add a bounded concurrency
+                                             limit and move to 202 + polling (F-7)
+  One bad deployment affects everything      Small, fast deploys; health checks; rollback
+  Shared database                            Intentional here: it is the consistency anchor
+  Perception that "monolith = legacy"        Modular + hexagonal + documented extraction path
+
+5.10 What would make us move to microservices (documented triggers, architecture.md section 19)
+  - Different teams start owning fetch / publish / analytics.
+  - A component needs independent scaling (for example Publisher far larger than Fetch).
+  - Several downstream consumers appear (Analytics, Billing, Forecasting).
+  - Near-real-time delivery replaces batch sync.
+  - Event replay becomes mandatory (Kafka becomes truly valuable).
+  Until at least one of these is real, microservices are speculative cost.
+
+5.11 Evolution path (how the monolith keeps the option open)
+  Step 1  Keep ports clean: SeriesSourcePort, SeriesPublisherPort, repository ports.
+  Step 2  Extract the integration adapter first (strangler pattern). Example: move orion-client into
+          its own service; only a new adapter implementing SeriesSourcePort is written - domain and
+          application code do not change.
+  Step 3  Introduce Kafka between Sync Service and new consumers (Analytics, Billing, ...) when
+          they exist (architecture.md section 19).
+  Step 4  Split Publisher only if measured load justifies it.
+  Pre-condition: regroup packages by capability if wide extraction is planned (see 2.2).
+
+5.12 One-paragraph version for slides
+  "We chose a modular monolith because the system's throughput is capped by Orion (5 req/s) and
+  LedgerPoint (10k rows/batch), not by our own compute; the pipeline is one tightly coupled
+  business transaction that needs publish-then-persist consistency; job locking is a one-line
+  database index; and the team is small and optimising for delivery. Hexagonal ports keep the
+  domain framework-free and every external system swappable, so extracting a microservice later is
+  a transport change, not a rewrite."
+
+
+====================================================================================================
+6. RECOMMENDED NEXT STEPS (before changing any code)
+====================================================================================================
+
+Decisions needed from you / the stakeholders
+  1. F-3: confirm the intended meaning of last_synced_date (month-end vs last data received).
+  2. F-7: is a synchronous trigger acceptable in production, or should the contract move to 202 +
+          polling?
+  3. ADR-005: confirm how TimescaleDB will be hosted on AWS (RDS has no TimescaleDB extension).
+
+Documentation fixes
+  4. Correct database-design.md section 5 criterion 4 (no DST warnings are emitted).
+  5. Update ADR-002 / architecture.md section 5 to describe the real layer-based packages.
+  6. Add the derived ADRs (008, 011, 012, 013, 014) to architecture.md.
+  7. Add an "Implementation status" section to architecture.md and a useful README (build, run,
+     env vars, how to run tests); fix the stale d:\poc_vs paths in plan.md.
+
+Code work, in priority order (each with a failing test first)
+  8. F-1  Job never left RUNNING on error + stale-RUNNING reaper.
+  9. F-2  Handle RequestNotPermitted / size the limiter wait for the largest job.
+ 10. F-3  Correct last_synced_date semantics.
+ 11. Roadmap #11 rule overrides, #12 staleness check, #13 full acceptance-criteria suite.
+ 12. F-4 Retry-After, F-6 fast-fail on LedgerPoint auth, F-8 metrics, F-10 extra ArchUnit rules.
+
+Proof required
+  13. Run the complete "mvn test" (including Testcontainers ITs with Docker) and attach the output;
+      slices 3-8 are recorded as not yet compiled/tested by the user.
+
+====================================================================================================
+END OF DOCUMENT
+====================================================================================================

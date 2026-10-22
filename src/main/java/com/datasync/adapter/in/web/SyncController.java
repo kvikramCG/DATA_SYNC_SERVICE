@@ -4,17 +4,22 @@ import com.datasync.domain.model.JobSummary;
 import com.datasync.domain.model.SeriesType;
 import com.datasync.domain.port.in.TriggerSyncUseCase;
 import org.slf4j.MDC;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
+import java.net.URI;
 import java.time.Instant;
 import java.util.UUID;
 
 /**
- * Inbound adapter for {@code POST /api/series/{seriesType}/sync} (spec &sect;7.1).
+ * Inbound adapter for {@code POST /api/series/{seriesType}/sync} (spec &sect;7.1). Responds
+ * {@code 202 Accepted} with the {@code RUNNING} job and a {@code Location} header pointing at
+ * {@code GET /api/jobs/{jobId}}, which callers poll for the outcome.
  */
 @RestController
 @RequestMapping("/api/series")
@@ -27,14 +32,16 @@ public class SyncController {
     }
 
     @PostMapping("/{seriesType}/sync")
-    public JobSummaryResponse sync(@PathVariable String seriesType,
-                                    @RequestParam(required = false) String seriesName,
-                                    @RequestParam(required = false) Instant startDate,
-                                    @RequestParam(required = false) Instant endDate) {
+    public ResponseEntity<JobSummaryResponse> sync(@PathVariable String seriesType,
+                                                    @RequestParam(required = false) String seriesName,
+                                                    @RequestParam(required = false) Instant startDate,
+                                                    @RequestParam(required = false) Instant endDate) {
         SeriesType type = SeriesType.fromWireValue(seriesType);
         JobSummary summary = triggerSyncUseCase.triggerSync(type, seriesName, startDate, endDate,
                 resolveCorrelationId());
-        return JobSummaryResponse.from(summary);
+        URI location = ServletUriComponentsBuilder.fromCurrentContextPath()
+                .path("/api/jobs/{jobId}").buildAndExpand(summary.jobId()).toUri();
+        return ResponseEntity.accepted().location(location).body(JobSummaryResponse.from(summary));
     }
 
     /**

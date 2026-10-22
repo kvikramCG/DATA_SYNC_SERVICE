@@ -25,6 +25,8 @@ orion:
   password: ${ORION_PASSWORD:}
   connect-timeout-ms: 5000
   read-timeout-ms: 60000
+  # Upper bound for honoring an Orion 429 Retry-After header before the next retry attempt.
+  max-retry-after: 60s
 
 ledgerpoint:
   base-url: ${LEDGERPOINT_BASE_URL:https://ledgerpoint.example.com}
@@ -33,13 +35,28 @@ ledgerpoint:
   read-timeout-ms: 60000
   max-batch-size: 10000
 
+datasync:
+  sync:
+    # Spec 6.9: a series whose Orion lastUpdatedDate is older than this many days fails with STALE_SERIES.
+    stale-after-days: 5
+  job:
+    # A job still RUNNING after this long is assumed orphaned (e.g. crash) and is closed as FAILED
+    # so it stops blocking its series type. Keep it well above the longest legitimate job.
+    max-running-duration: PT2H
+    reaper-interval: PT5M
+    reaper-initial-delay: PT1M
+
 resilience4j:
   ratelimiter:
     instances:
       orion:
         limit-for-period: 5
         limit-refresh-period: 1s
-        timeout-duration: 10s
+        # How long a virtual thread may wait for a permit. All series Tasks of a Job start at once
+        # and share 5 permits/second, so waiting time grows with job size (N calls need ~N/5 s).
+        # 30m allows ~9,000 queued Orion calls; waiting virtual threads are cheap. If it is still
+        # exceeded, the Task fails with SOURCE_UNAVAILABLE instead of staying PENDING.
+        timeout-duration: 30m
   retry:
     instances:
       orion:
@@ -66,8 +83,8 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
 
 logging:
   pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss} %-5level [%X{correlationId}] %logger{36} - %msg%n"
+    console: "%d{yyyy-MM-dd HH:mm:ss} %-5level [cid=%X{correlationId} job=%X{jobId} series=%X{seriesName}] %logger{36} - %msg%n"

@@ -27,10 +27,18 @@ public class ChunkRepositoryAdapter implements ChunkRepositoryPort {
     @Override
     @Transactional
     public Long createChunk(Long taskId, LocalDate chunkStart, LocalDate chunkEnd) {
-        // Exactly one logical fetchValues call is issued per chunk by SeriesSyncWorker; internal
-        // HTTP-level retries inside the Orion adapter are not visible at this layer.
-        JobTaskChunkEntity entity = new JobTaskChunkEntity(taskId, chunkStart, chunkEnd, 1, ChunkStatus.FETCHED.name());
+        // Starting value; SeriesSyncWorker overwrites it with the real HTTP call count (retries and
+        // token refreshes included) once the fetch returns.
+        JobTaskChunkEntity entity = new JobTaskChunkEntity(taskId, chunkStart, chunkEnd, 1, ChunkStatus.PENDING.name());
         return chunkRepository.save(entity).getId();
+    }
+
+    @Override
+    @Transactional
+    public void markChunkStage(Long chunkId, ChunkStatus stage) {
+        if (chunkRepository.updateStatus(chunkId, stage.name()) == 0) {
+            throw new IllegalArgumentException("No job_task_chunk found with id " + chunkId);
+        }
     }
 
     @Override
@@ -45,6 +53,15 @@ public class ChunkRepositoryAdapter implements ChunkRepositoryPort {
         entity.setValuesUpdated(valuesUpdated);
         entity.setValuesUnchanged(valuesUnchanged);
         entity.setLedgerPointBatchId(ledgerPointBatchId);
+        chunkRepository.save(entity);
+    }
+
+    @Override
+    @Transactional
+    public void updateOrionCallCount(Long chunkId, int orionCallCount) {
+        JobTaskChunkEntity entity = chunkRepository.findById(chunkId)
+                .orElseThrow(() -> new IllegalArgumentException("No job_task_chunk found with id " + chunkId));
+        entity.setOrionCallCount(orionCallCount);
         chunkRepository.save(entity);
     }
 

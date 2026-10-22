@@ -28,4 +28,14 @@ class HexagonalArchitectureTest {
     static final ArchRule application_must_not_depend_on_adapters =
             noClasses().that().resideInAPackage("..application..")
                     .should().dependOnClassesThat().resideInAPackage("..adapter..");
+
+    @ArchTest
+    static final ArchRule inbound_adapters_must_not_depend_on_outbound_adapters =
+            noClasses().that().resideInAPackage("..adapter.in..")
+                    .should().dependOnClassesThat().resideInAPackage("..adapter.out..");
+
+    @ArchTest
+    static final ArchRule application_must_not_use_persistence_types =
+            noClasses().that().resideInAPackage("..application..")
+                    .should().dependOnClassesThat().resideInAnyPackage("jakarta.persistence..", "org.springframework.data..");
 }

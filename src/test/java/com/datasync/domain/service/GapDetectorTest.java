@@ -56,10 +56,10 @@ class GapDetectorTest {
     void repeatedHourEntriesDoNotCountTowardsTheExpectedBaseSet() {
         LocalDate date = LocalDate.of(2026, 11, 1);
         List<NormalizedSeriesValue> values = List.of(
-                new NormalizedSeriesValue(date, "2", Instant.parse("2026-11-01T07:00:00Z"), false, BigDecimal.ONE),
-                new NormalizedSeriesValue(date, "2x", Instant.parse("2026-11-01T08:00:00Z"), true, BigDecimal.ONE));
+                new NormalizedSeriesValue(date, "1", Instant.parse("2026-11-01T07:00:00Z"), false, BigDecimal.ONE),
+                new NormalizedSeriesValue(date, "1x", Instant.parse("2026-11-01T08:00:00Z"), true, BigDecimal.ONE));
 
-        // Only interval "2" (base) is required; "2x" doesn't satisfy some other missing base slot.
+        // Daily granularity expects only base interval "1"; the repeated "1x" entry adds no expected slot.
         List<MissingInterval> gaps = GapDetector.findMissingIntervals(date, date, values, 1440);
 
         assertThat(gaps).isEmpty();

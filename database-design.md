@@ -142,7 +142,7 @@ One row per series within a job (spec §7.2).
 | `job_id` | `bigint` | FK → `job.id`, not null | |
 | `series_id` | `bigint` | FK → `series.id`, not null | |
 | `status` | `varchar(30)` | not null | `PENDING` \| `SUCCESS` \| `SUCCESS_WITH_WARNINGS` \| `SKIPPED` \| `FAILED` |
-| `failure_reason` | `varchar(50)` | nullable | one of the §8.1 codes: `SOURCE_UNAVAILABLE`, `NO_DATA`, `STALE_SERIES`, `UNSUPPORTED_GRANULARITY`, `UNSUPPORTED_TIMEZONE`, `TARGET_REJECTED`, `UNKNOWN_SERIES`, `TARGET_UNAVAILABLE` |
+| `failure_reason` | `varchar(50)` | nullable | one of the §8.1 codes: `SOURCE_UNAVAILABLE`, `NO_DATA`, `STALE_SERIES`, `UNSUPPORTED_GRANULARITY`, `UNSUPPORTED_TIMEZONE`, `TARGET_REJECTED`, `UNKNOWN_SERIES`, `TARGET_UNAVAILABLE`, `INTERNAL_ERROR` |
 | `failure_detail` | `varchar(2000)` | nullable | e.g. LedgerPoint 400 error body |
 | `values_sent` | `int` | not null, default 0 | |
 | `started_at` | `timestamptz` | nullable | |
@@ -163,8 +163,8 @@ answer to "how many Orion calls did this series make" and a mid-job resume point
 | `job_task_id` | `bigint` | FK → `job_task.id`, not null | |
 | `chunk_start_date` | `date` | not null | first day of the month chunk |
 | `chunk_end_date` | `date` | not null | last day of the month chunk |
-| `orion_call_count` | `int` | not null, default 0 | normally 1; >1 only if a retry re-issued the call |
-| `status` | `varchar(30)` | not null | `FETCHED` \| `TRANSFORMED` \| `PUBLISHED` \| `PERSISTED` \| `FAILED` |
+| `orion_call_count` | `int` | not null, default 0 | normally 1; >1 when a retry or a 401 token refresh re-issued the HTTP call. Written once the fetch returns; a chunk whose fetch ultimately fails keeps the initial 1 |
+| `status` | `varchar(30)` | not null | lifecycle `PENDING` (created) → `FETCHED` → `TRANSFORMED` → `PUBLISHED` → `PERSISTED`; `FAILED` on any error. A chunk with nothing to send skips `PUBLISHED`; an empty month goes straight to `PERSISTED`. |
 | `values_fetched` | `int` | not null, default 0 | |
 | `values_new` | `int` | not null, default 0 | |
 | `values_updated` | `int` | not null, default 0 | |
@@ -260,8 +260,8 @@ No compression policy is configured for the POC (see `architecture.md` §9 "Scop
 |---|---|
 | `job.status` | `RUNNING`, `COMPLETED`, `COMPLETED_WITH_FAILURES`, `FAILED` |
 | `job_task.status` | `PENDING`, `SUCCESS`, `SUCCESS_WITH_WARNINGS`, `SKIPPED`, `FAILED` |
-| `job_task.failure_reason` | `SOURCE_UNAVAILABLE`, `NO_DATA`, `STALE_SERIES`, `UNSUPPORTED_GRANULARITY`, `UNSUPPORTED_TIMEZONE`, `TARGET_REJECTED`, `UNKNOWN_SERIES`, `TARGET_UNAVAILABLE` |
-| `job_task_chunk.status` | `FETCHED`, `TRANSFORMED`, `PUBLISHED`, `PERSISTED`, `FAILED` |
+| `job_task.failure_reason` | `SOURCE_UNAVAILABLE`, `NO_DATA`, `STALE_SERIES`, `UNSUPPORTED_GRANULARITY`, `UNSUPPORTED_TIMEZONE`, `TARGET_REJECTED`, `UNKNOWN_SERIES`, `TARGET_UNAVAILABLE`, `INTERNAL_ERROR` |
+| `job_task_chunk.status` | `PENDING`, `FETCHED`, `TRANSFORMED`, `PUBLISHED`, `PERSISTED`, `FAILED` |
 | `task_warning.warning_type` | `GAP_MISSING`, `DST_SPRING_FORWARD_FILLED`, `DST_FALL_BACK_REPEATED` |
 
 `varchar` (not native Postgres `enum`) is used deliberately so new values (e.g. a future failure
@@ -276,11 +276,11 @@ reason) only require an application-side change, not a migration that alters a t
 | 1 | Sync every series, correct `taskCounts` | `job_task.status` grouped by `job_id` reproduces `taskCounts` exactly |
 | 2 | 3-month window → exactly 3 Orion calls | `job_task_chunk` rows (one per month) with `orion_call_count`, queryable per `job_task_id` |
 | 3 | Fall-back day → 25 rows incl. one `Nx` | `series_value.interval_number` stores the literal token (e.g. `2x`); `repeated_hour=true` row coexists with `repeated_hour=false` row at the same `interval_number` prefix |
-| 4 | Spring-forward → 24 rows, filled, no `x` | filled row persisted like any other `series_value` row; `task_warning` records a `DST_SPRING_FORWARD_FILLED` entry for audit without blocking success |
+| 4 | Spring-forward → 24 rows, filled, no `x` | filled row persisted like any other `series_value` row; no `task_warning` is recorded for the fill (it is silent, spec §6.4/§6.8) |
 | 5 | 15-min → `1..96`; daily → `1` | `interval_number` computed per §6.3 and stored verbatim; no schema constraint needed since computation is domain logic |
 | 6 | Re-run sends 0 values | diff compares incoming values against existing `series_value` PK `(series_id, start_instant, repeated_hour)`; all match ⇒ `values_unchanged` in `job_task_chunk`, nothing posted |
 | 7 | Change one value → sends exactly 1 | same PK lookup finds one row where `value` differs ⇒ classified `values_updated=1` |
-| 8 | Orion 429 → retry succeeds | not a schema concern; `job_task_chunk.orion_call_count` would show >1 if a retry re-issued the call |
+| 8 | Orion 429 → retry succeeds | not a schema concern; `job_task_chunk.orion_call_count` shows >1 when a retry re-issued the call |
 | 9 | Orion 401 mid-run → refresh, continue | not a schema concern (token cache is in-memory in the adapter) |
 | 10 | LedgerPoint 400 on one series → only that Task fails | `job_task.status='FAILED'`, `failure_reason='TARGET_REJECTED'`, `failure_detail` stores the error body; sibling `job_task` rows unaffected |
 | 11 | Stale series → `FAILED`/`STALE_SERIES`, nothing posted | `series.last_updated_date` checked before any `job_task_chunk` is created; `job_task.failure_reason='STALE_SERIES'` |

@@ -24,4 +24,10 @@ public interface SeriesRepositoryPort {
      * successfully finishes processing its whole window.
      */
     void updateLastSyncedDate(Long seriesId, LocalDate lastSyncedDate);
+
+    /**
+     * Stores the unit Orion last reported for the series (database-design.md &sect;3.5: refreshed on
+     * every values fetch). A no-op when the stored unit is already equal.
+     */
+    void updateUnit(Long seriesId, String unit);
 }

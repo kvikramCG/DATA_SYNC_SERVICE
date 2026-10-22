@@ -10,9 +10,11 @@ import io.github.resilience4j.ratelimiter.RateLimiterConfig;
 import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
@@ -51,13 +53,15 @@ class OrionClientAdapterTest {
 
     private WireMockServer wireMockServer;
     private OrionClientAdapter adapter;
+    private OrionProperties properties;
+    private SimpleMeterRegistry meterRegistry;
 
     @BeforeEach
     void setUp() {
         wireMockServer = new WireMockServer(options().dynamicPort());
         wireMockServer.start();
 
-        OrionProperties properties = new OrionProperties();
+        properties = new OrionProperties();
         properties.setBaseUrl(wireMockServer.baseUrl());
         properties.setLogin("svc-data-sync");
         properties.setPassword("secret");
@@ -86,7 +90,89 @@ class OrionClientAdapterTest {
                 .retryExceptions(OrionTransientException.class)
                 .build());
 
-        adapter = new OrionClientAdapter(restClient, tokenCache, rateLimiterRegistry, retryRegistry);
+        meterRegistry = new SimpleMeterRegistry();
+        adapter = new OrionClientAdapter(restClient, tokenCache, properties, rateLimiterRegistry, retryRegistry,
+                meterRegistry);
+    }
+
+    private double orionRequests(String operation, String outcome) {
+        var counter = meterRegistry.find(OrionClientAdapter.REQUESTS_METRIC)
+                .tags("operation", operation, "outcome", outcome).counter();
+        return counter == null ? 0 : counter.count();
+    }
+
+    private void stubRateLimitedThenOk(String retryAfterHeader) {
+        wireMockServer.stubFor(post(urlEqualTo("/auth/token")).willReturn(okJson(TOKEN_JSON)));
+        var rateLimited = aResponse().withStatus(429);
+        if (retryAfterHeader != null) {
+            rateLimited = rateLimited.withHeader("Retry-After", retryAfterHeader);
+        }
+        wireMockServer.stubFor(get(urlPathEqualTo("/v1/series")).inScenario("retry-after")
+                .whenScenarioStateIs(STARTED)
+                .willReturn(rateLimited)
+                .willSetStateTo("second"));
+        wireMockServer.stubFor(get(urlPathEqualTo("/v1/series")).inScenario("retry-after")
+                .whenScenarioStateIs("second")
+                .willReturn(okJson(SERIES_JSON)));
+    }
+
+    @Test
+    void honorsRetryAfterSecondsOn429BeforeRetrying() {
+        stubRateLimitedThenOk("1");
+
+        long startNanos = System.nanoTime();
+        List<SeriesDescriptor> result = adapter.listSeries(SeriesType.TYPE_A);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startNanos);
+
+        assertThat(result).hasSize(1);
+        assertThat(elapsed).isGreaterThanOrEqualTo(Duration.ofMillis(950));
+    }
+
+    @Test
+    void retryAfterIsCappedByMaxRetryAfter() {
+        properties.setMaxRetryAfter(Duration.ofMillis(50));
+        stubRateLimitedThenOk("30");
+
+        long startNanos = System.nanoTime();
+        List<SeriesDescriptor> result = adapter.listSeries(SeriesType.TYPE_A);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startNanos);
+
+        assertThat(result).hasSize(1);
+        assertThat(elapsed).isLessThan(Duration.ofSeconds(5));
+    }
+
+    @Test
+    void unparseableRetryAfterIsIgnoredAndTheNormalBackoffApplies() {
+        stubRateLimitedThenOk("Wed, 21 Oct 2026 07:28:00 GMT");
+
+        long startNanos = System.nanoTime();
+        List<SeriesDescriptor> result = adapter.listSeries(SeriesType.TYPE_A);
+        Duration elapsed = Duration.ofNanos(System.nanoTime() - startNanos);
+
+        assertThat(result).hasSize(1);
+        assertThat(elapsed).isLessThan(Duration.ofMillis(900));
+    }
+
+    @Test
+    void parseRetryAfterAcceptsOnlyNonNegativeSeconds() {
+        HttpHeaders seconds = new HttpHeaders();
+        seconds.set(HttpHeaders.RETRY_AFTER, " 7 ");
+        HttpHeaders negative = new HttpHeaders();
+        negative.set(HttpHeaders.RETRY_AFTER, "-3");
+
+        assertThat(OrionClientAdapter.parseRetryAfter(seconds)).isEqualTo(Duration.ofSeconds(7));
+        assertThat(OrionClientAdapter.parseRetryAfter(negative)).isNull();
+        assertThat(OrionClientAdapter.parseRetryAfter(new HttpHeaders())).isNull();
+    }
+
+    @Test
+    void requestOutcomesAreCountedPerAttempt() {
+        stubRateLimitedThenOk(null);
+
+        adapter.listSeries(SeriesType.TYPE_A);
+
+        assertThat(orionRequests("list_series", "rate_limited")).isEqualTo(1);
+        assertThat(orionRequests("list_series", "success")).isEqualTo(1);
     }
 
     @AfterEach
@@ -144,7 +230,7 @@ class OrionClientAdapterTest {
     }
 
     @Test
-    void skipsSeriesWithUnsupportedTimezone() {
+    void keepsSeriesWithUnsupportedTimezoneSoItsTaskCanFail() {
         String mixedJson = """
                 {"series":[
                   {"seriesName":"SERIES_BAD_TZ","seriesType":"typeA","timeZone":99,
@@ -160,8 +246,12 @@ class OrionClientAdapterTest {
 
         List<SeriesDescriptor> result = adapter.listSeries(SeriesType.TYPE_A);
 
-        assertThat(result).hasSize(1);
-        assertThat(result.get(0).name()).isEqualTo("SERIES_ALPHA_001");
+        assertThat(result).hasSize(2);
+        assertThat(result.get(0).name()).isEqualTo("SERIES_BAD_TZ");
+        assertThat(result.get(0).timeZone()).isNull();
+        assertThat(result.get(0).orionTimeZoneCode()).isEqualTo(99);
+        assertThat(result.get(1).name()).isEqualTo("SERIES_ALPHA_001");
+        assertThat(result.get(1).timeZone()).isEqualTo(TimeZoneCode.CENTRAL);
     }
 
     @Test
@@ -192,6 +282,43 @@ class OrionClientAdapterTest {
         assertThat(result.values()).hasSize(4);
         assertThat(result.values().get(2).repeatedHour()).isTrue();
         assertThat(result.values().get(2).value()).isEqualByComparingTo("29.10");
+        assertThat(result.orionCallCount()).isEqualTo(1);
+    }
+
+    private static final String EMPTY_VALUES_JSON = """
+            {"seriesName":"SERIES_ALPHA_001","unit":"UNIT_A","granularity":60,"timeZone":6,
+            "asOfDate":"10/12/2026 6:00:00 PM","values":[]}
+            """;
+
+    private void stubValuesAfterFirstResponse(int firstStatus) {
+        wireMockServer.stubFor(post(urlEqualTo("/auth/token")).willReturn(okJson(TOKEN_JSON)));
+        wireMockServer.stubFor(get(urlPathMatching("/v1/series/SERIES_ALPHA_001/values")).inScenario("values-retry")
+                .whenScenarioStateIs(STARTED)
+                .willReturn(aResponse().withStatus(firstStatus))
+                .willSetStateTo("second"));
+        wireMockServer.stubFor(get(urlPathMatching("/v1/series/SERIES_ALPHA_001/values")).inScenario("values-retry")
+                .whenScenarioStateIs("second")
+                .willReturn(okJson(EMPTY_VALUES_JSON)));
+    }
+
+    @Test
+    void fetchValuesCountsTheRetriedHttpCall() {
+        stubValuesAfterFirstResponse(503);
+
+        SeriesValuesResult result = adapter.fetchValues("SERIES_ALPHA_001",
+                LocalDateTime.of(2026, 11, 1, 0, 0, 0), LocalDateTime.of(2026, 11, 30, 23, 59, 59));
+
+        assertThat(result.orionCallCount()).isEqualTo(2);
+    }
+
+    @Test
+    void fetchValuesCountsTheCallAfterATokenRefresh() {
+        stubValuesAfterFirstResponse(401);
+
+        SeriesValuesResult result = adapter.fetchValues("SERIES_ALPHA_001",
+                LocalDateTime.of(2026, 11, 1, 0, 0, 0), LocalDateTime.of(2026, 11, 30, 23, 59, 59));
+
+        assertThat(result.orionCallCount()).isEqualTo(2);
     }
 }
 

@@ -67,6 +67,12 @@ public class JobRepositoryAdapter implements JobRepositoryPort {
     }
 
     @Override
+    @Transactional
+    public int failStaleRunningJobs(Instant startedBefore) {
+        return repository.failRunningJobsStartedBefore(startedBefore, clock.now());
+    }
+
+    @Override
     public Optional<Job> findById(Long jobId) {
         return repository.findById(jobId).map(this::toDomain);
     }

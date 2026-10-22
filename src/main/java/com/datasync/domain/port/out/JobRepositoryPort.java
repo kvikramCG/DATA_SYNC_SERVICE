@@ -23,5 +23,14 @@ public interface JobRepositoryPort {
 
     void markJobFinished(Long jobId, JobStatus status);
 
+    /**
+     * Closes every job still {@code RUNNING} that started before {@code startedBefore} as
+     * {@link JobStatus#FAILED}. Orphaned RUNNING rows (process crash, unexpected failure) would
+     * otherwise block every later sync of that series type via the unique partial index.
+     *
+     * @return the number of jobs closed
+     */
+    int failStaleRunningJobs(Instant startedBefore);
+
     Optional<Job> findById(Long jobId);
 }
