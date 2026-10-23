@@ -630,11 +630,18 @@ class AcceptanceCriteriaTest {
         }
 
         @Override
+        public synchronized void markTaskStarted(Long taskId) {
+            JobTask t = tasks.get(taskId);
+            tasks.put(taskId, new JobTask(t.id(), t.jobId(), t.seriesId(), t.seriesName(), TaskStatus.RUNNING,
+                    null, null, 0, NOW, null));
+        }
+
+        @Override
         public synchronized void updateTaskStatus(Long taskId, TaskStatus status, FailureReason reason,
                                                    String detail, int valuesSent) {
             JobTask t = tasks.get(taskId);
             tasks.put(taskId, new JobTask(t.id(), t.jobId(), t.seriesId(), t.seriesName(), status, reason, detail,
-                    valuesSent, NOW, NOW));
+                    valuesSent, t.startedAt() != null ? t.startedAt() : NOW, NOW));
         }
 
         // SeriesRepositoryPort

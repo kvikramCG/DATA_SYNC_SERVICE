@@ -52,6 +52,19 @@ public class TaskRepositoryAdapter implements TaskRepositoryPort {
 
     @Override
     @Transactional
+    public void markTaskStarted(Long taskId) {
+        JobTaskEntity entity = repository.findById(taskId)
+                .orElseThrow(() -> new IllegalArgumentException("No task found with id " + taskId));
+        // started_at is written here, at the real start, instead of at the first (= final) status write;
+        // otherwise started_at == finished_at and the duration is lost. job_task.status is a plain
+        // VARCHAR(30) with no CHECK constraint, so the new value needs no migration.
+        entity.setStartedAt(clock.now());
+        entity.setStatus(TaskStatus.RUNNING.name());
+        repository.save(entity);
+    }
+
+    @Override
+    @Transactional
     public void updateTaskStatus(Long taskId, TaskStatus status, FailureReason failureReason,
                                   String failureDetail, int valuesSent) {
         JobTaskEntity entity = repository.findById(taskId)

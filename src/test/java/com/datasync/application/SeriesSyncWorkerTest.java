@@ -1,9 +1,11 @@
 package com.datasync.application;
 
 import com.datasync.domain.exception.LedgerPointAuthException;
+import com.datasync.domain.exception.LedgerPointValidationException;
 import com.datasync.domain.model.ChunkStatus;
 import com.datasync.domain.model.FailureReason;
 import com.datasync.domain.model.LedgerPointPublishResult;
+import com.datasync.domain.model.LedgerPointValidationError;
 import com.datasync.domain.model.RawSeriesValue;
 import com.datasync.domain.model.SeriesDescriptor;
 import com.datasync.domain.model.SeriesRuleOverride;
@@ -247,6 +249,83 @@ class SeriesSyncWorkerTest {
                 eq(FailureReason.INTERNAL_ERROR), any(), eq(0));
         verify(chunkRepositoryPort).updateChunkStatus(eq(CHUNK_ID), eq(ChunkStatus.FAILED), eq(0), eq(0), eq(0),
                 eq(0), any());
+    }
+
+    @Test
+    void taskIsMarkedStartedBeforeItsFinalStatusIsWritten() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenReturn(oneDailyValue(new BigDecimal("31.25")));
+        when(seriesValuePort.findExistingValues(eq(1L), any(), any())).thenReturn(Map.of());
+        when(seriesPublisherPort.publish(any(), any(), any(), anyList(), any()))
+                .thenReturn(new LedgerPointPublishResult(1, 1, 0, List.of()));
+
+        worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(), new AtomicBoolean());
+
+        InOrder order = inOrder(taskRepositoryPort);
+        order.verify(taskRepositoryPort).markTaskStarted(TASK_ID);
+        order.verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.SUCCESS), any(), any(), eq(1));
+    }
+
+    @Test
+    void taskThatIsAbortedBeforeStartingIsNeverMarkedStarted() {
+        AtomicBoolean aborted = new AtomicBoolean(true);
+
+        worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(), aborted);
+
+        verify(taskRepositoryPort, never()).markTaskStarted(any());
+    }
+
+    @Test
+    void rejectedBatchFailureDetailListsTheRowErrorsFromLedgerPoint() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenReturn(oneDailyValue(new BigDecimal("31.25")));
+        when(seriesValuePort.findExistingValues(eq(1L), any(), any())).thenReturn(Map.of());
+        List<LedgerPointValidationError> rowErrors = new java.util.ArrayList<>();
+        for (int i = 0; i < 7; i++) {
+            rowErrors.add(new LedgerPointValidationError(i, "value", "not a number"));
+        }
+        when(seriesPublisherPort.publish(any(), any(), any(), anyList(), any()))
+                .thenThrow(new LedgerPointValidationException("LedgerPoint rejected the batch", rowErrors));
+
+        TaskOutcome outcome = worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.FAILED);
+        org.mockito.ArgumentCaptor<String> detail = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.FAILED),
+                eq(FailureReason.TARGET_REJECTED), detail.capture(), eq(0));
+        assertThat(detail.getValue())
+                .startsWith("LedgerPoint rejected the batch: [batch row 0 value: not a number")
+                .contains("batch row 4 value: not a number")
+                .doesNotContain("batch row 5")
+                .endsWith("(+2 more)");
+    }
+
+    @Test
+    void rejectedBatchWithNoParsableRowErrorsKeepsTheGenericMessage() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenReturn(oneDailyValue(new BigDecimal("31.25")));
+        when(seriesValuePort.findExistingValues(eq(1L), any(), any())).thenReturn(Map.of());
+        when(seriesPublisherPort.publish(any(), any(), any(), anyList(), any()))
+                .thenThrow(new LedgerPointValidationException("LedgerPoint rejected the batch", List.of()));
+
+        worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(), new AtomicBoolean());
+
+        verify(taskRepositoryPort).updateTaskStatus(TASK_ID, TaskStatus.FAILED, FailureReason.TARGET_REJECTED,
+                "LedgerPoint rejected the batch", 0);
+    }
+
+    @Test
+    void failureDetailLongerThanTheColumnIsTruncatedAndStripsControlCharacters() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenThrow(new IllegalStateException("line1\nline2 " + "x".repeat(5_000)));
+
+        worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(), new AtomicBoolean());
+
+        org.mockito.ArgumentCaptor<String> detail = org.mockito.ArgumentCaptor.forClass(String.class);
+        verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.FAILED),
+                eq(FailureReason.INTERNAL_ERROR), detail.capture(), eq(0));
+        assertThat(detail.getValue()).hasSize(2000).endsWith("...").doesNotContain("\n");
     }
 
     @Test

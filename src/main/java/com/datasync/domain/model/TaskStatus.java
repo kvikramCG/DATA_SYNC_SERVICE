@@ -5,6 +5,8 @@ package com.datasync.domain.model;
  */
 public enum TaskStatus {
     PENDING,
+    /** The worker has picked the Task up; set together with {@code started_at} so duration is measurable. */
+    RUNNING,
     SUCCESS,
     SUCCESS_WITH_WARNINGS,
     SKIPPED,

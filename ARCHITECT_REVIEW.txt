@@ -1,0 +1,521 @@
+DATA SYNC SERVICE - TECHNICAL ARCHITECT REVIEW
+==============================================
+
+Scope: read-only review. No source code was changed. No build or tests were run.
+Only test names were listed and the surefire reports were checked.
+Line numbers were verified against the current files. Items marked (verify) need a runtime check.
+
+Path abbreviations used below:
+  ORCH   = src/main/java/com/datasync/application/SyncOrchestrationService.java
+  WORKER = src/main/java/com/datasync/application/SeriesSyncWorker.java
+  REAPER = src/main/java/com/datasync/application/StaleJobReaper.java
+  CATALOG= src/main/java/com/datasync/application/SeriesCatalogService.java
+  FILTER = src/main/java/com/datasync/adapter/in/web/CorrelationIdFilter.java
+  CTRL   = src/main/java/com/datasync/adapter/in/web/SyncController.java
+  JOBREPO= src/main/java/com/datasync/adapter/out/persistence/JobRepositoryAdapter.java
+  SERREPO= src/main/java/com/datasync/adapter/out/persistence/SeriesRepositoryAdapter.java
+  VALREPO= src/main/java/com/datasync/adapter/out/persistence/SeriesValueRepositoryAdapter.java
+  TASKREPO=src/main/java/com/datasync/adapter/out/persistence/TaskRepositoryAdapter.java
+  ORION  = src/main/java/com/datasync/adapter/out/orion/OrionClientAdapter.java
+  TOKEN  = src/main/java/com/datasync/adapter/out/orion/OrionTokenCache.java
+  LP     = src/main/java/com/datasync/adapter/out/ledgerpoint/LedgerPointClientAdapter.java
+  VTCFG  = src/main/java/com/datasync/config/VirtualThreadConfig.java
+  YML    = src/main/resources/application.yml
+
+
+--------------------------------------------------------------------------------
+1. PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+
+Layers (enforced by HexagonalArchitectureTest):
+
+  adapter.in.web   SyncController, JobController, CorrelationIdFilter, GlobalExceptionHandler
+  application      SyncOrchestrationService, SeriesSyncWorker, SeriesCatalogService, StaleJobReaper
+  domain           Pure logic: MonthChunker, DstAdjustmentService, IntervalAssigner, ChangeDetector,
+                   GapDetector, BatchSplitter, StalenessChecker, UnitMapper
+  adapter.out      orion, ledgerpoint, persistence, metrics, clock
+
+Worked example used through the whole review:
+
+  POST /api/series/TYPE_A/sync?startDate=2026-01-01&endDate=2026-03-31
+  Header: X-Correlation-Id: 7c1e...
+
+  - Orion has 1000 TYPE_A series. The service answers 202 with Location: /api/jobs/42.
+  - It creates 1000 tasks and 3 monthly chunks per task:
+    3000 Orion value calls plus 1 list call.
+  - A DST fall-back day yields 25 rows, with an "X" suffix on the repeated hour.
+  - Re-running the same request posts nothing to LedgerPoint, because ChangeDetector
+    finds every value UNCHANGED.
+
+
+--------------------------------------------------------------------------------
+2. COMPREHENSIVE RUNTIME FLOW
+--------------------------------------------------------------------------------
+
+Sequence (ASCII):
+
+  Client -> Filter -> Controller -> Orchestration(job vthread) -> Worker(1 vthread/series)
+                                                                   |-> Orion
+                                                                   |-> LedgerPoint
+                                                                   '-> Postgres
+
+  1. Client POST /sync (X-Correlation-Id)
+  2. Filter puts correlationId in MDC
+  3. Controller -> triggerSync
+  4. Orchestration INSERT job RUNNING (tx 1, committed)  -> 202 returned to client
+  5. Job thread: Orion list series -> upsert catalog (1 tx) -> INSERT job_task x N
+  6. invokeAll(N callables) -> one virtual thread per series
+  7. Per chunk: INSERT chunk -> Orion fetch -> UPDATE unit/call count/stage
+                -> SELECT existing values -> LedgerPoint POST -> upsert values (1 tx)
+                -> chunk PERSISTED
+  8. Task final status -> Job final status
+
+Step table (Step | Code | DB interaction | Failure path):
+
+ #1  Correlation filter puts header (or new UUID) in MDC
+     FILTER L27-L36
+     DB: none
+     Failure: a non-UUID header is accepted here, replaced downstream (see 4, L1)
+
+ #2  Controller validates window, builds correlation UUID
+     CTRL L34, L53-L61
+     DB: none
+     Failure: IllegalArgumentException -> 400
+
+ #3  Create RUNNING job
+     ORCH L100 -> JOBREPO L37
+     DB: INSERT job in its own committed tx; partial unique index = one RUNNING job per type
+     Failure: DataIntegrityViolationException -> JobAlreadyRunningException (JOBREPO L53) -> 409
+
+ #4  Hand off to a virtual thread
+     ORCH L105
+     DB: none
+     Failure: executor rejection marks job FAILED and rethrows
+
+ #5  Job thread sets MDC correlationId + jobId, always removes them
+     ORCH L116-L126
+     DB: none
+     Failure: catch RuntimeException (L120) -> failJobQuietly (L163)
+
+ #6  Refresh catalog from Orion
+     ORCH L132; CATALOG L28-L30
+     DB: findById + save per series, all in ONE tx (SERREPO L34)
+     Failure: any Orion or DB error FAILs the whole job (see 5, e)
+
+ #7  Create one task per series
+     ORCH L146
+     DB: INSERT job_task (PENDING), one tx each
+     Failure: failure midway leaves earlier tasks PENDING (see 5, c)
+
+ #8  Fan out with invokeAll
+     ORCH L177-L204
+     DB: none
+     Failure: ExecutionException handled L209; InterruptedException L216
+
+ #9  Task thread sets MDC seriesName and calls worker.process
+     ORCH L188-L197
+     DB: none
+     Failure: MDC removed in finally
+
+ #10 Exception -> failure reason mapping
+     WORKER L106-L143
+     DB: fail() writes the task row (WORKER L311-L315)
+     Failure: the fail() write can itself throw (see 5, a)
+
+ #11 Skip, timezone, window and staleness checks
+     WORKER L147-L169
+     DB: SELECT override rule; UPDATE task for SKIPPED
+     Failure: SKIPPED, UNSUPPORTED_TIMEZONE, NO_DATA, STALE_SERIES
+
+ #12 Per chunk: create the chunk row
+     WORKER L216
+     DB: INSERT job_task_chunk (unique on task + start date)
+     Failure: throws outside the chunk try block and propagates
+
+ #13 Fetch from Orion (token cache, rate limiter 5/s, retry 3x at 300 ms, 429 Retry-After)
+     WORKER L218; ORION L86, L150
+     DB: UPDATE chunk orion_call_count (WORKER L220)
+     Failure: 401 refreshes token once; limiter timeout = RequestNotPermitted (L132)
+              -> SOURCE_UNAVAILABLE; other errors -> SOURCE_UNAVAILABLE
+
+ #14 Persist the unit
+     WORKER L228
+     DB: findById + UPDATE series.unit (VARCHAR(20))
+     Failure: over-long unit -> DB exception -> INTERNAL_ERROR
+
+ #15 Normalise: DST adjust, assign intervals, detect gaps
+     WORKER L226-L262
+     DB: SELECT existing values for the range (L256)
+     Failure: unparseable date or null value -> INTERNAL_ERROR
+
+ #16 Publish to LedgerPoint in batches
+     WORKER L270-L278; LP L104-L140
+     DB: stage UPDATE to PUBLISHED (L278)
+     Failure: 400 -> TARGET_REJECTED; 409 -> UNKNOWN_SERIES; 401/403 aborts the job;
+              5xx or network error retried, then TARGET_UNAVAILABLE
+
+ #17 Persist values
+     WORKER L282; VALREPO L41-L53
+     DB: one tx per chunk, SELECT + INSERT/UPDATE per row (see 3, T2)
+     Failure: failure after publish leaves the chunk PUBLISHED (safe to re-run)
+
+ #18 Chunk PERSISTED, or FAILED on exception
+     WORKER L285-L291
+     DB: UPDATE chunk
+     Failure: the FAILED update can throw and mask the original error (see 5, b)
+
+ #19 Advance watermark and set final task status
+     WORKER L203-L205
+     DB: UPDATE series.last_synced_date (never moves backwards); UPDATE job_task
+     Failure: watermark is written only after all chunks succeed
+
+ #20 Close the job from the task counts
+     ORCH L151-L159, L253
+     DB: UPDATE job
+     Failure: PENDING tasks are not counted as failures (see 5, a)
+
+ #21 Reaper fails RUNNING jobs older than 2h
+     REAPER L41-L45
+     DB: bulk UPDATE job
+     Failure: does not stop live threads (see 3, T4)
+
+
+--------------------------------------------------------------------------------
+3. TRANSACTIONS: BOUNDARIES, ISOLATION, PROPAGATION
+--------------------------------------------------------------------------------
+
+Design: there is no outer transaction, open-in-view is false, and each @Transactional
+adapter method is a short, independent REQUIRED tx. Isolation is never set, so it is the
+PostgreSQL default, READ COMMITTED. A DB connection is never held during an HTTP call.
+
+Example: chunk 2 of series S1 fetches from Orion with no connection held. It then commits
+the unit update, the stage update, the value upsert and PERSISTED, each as its own tx.
+If LedgerPoint accepts the batch and the value upsert fails, the chunk is left at
+PUBLISHED. A re-run resends it; this is safe only because LedgerPoint upserts.
+
+Findings:
+
+ T1 (Low)    Publish and persist are not atomic. WORKER L274-L282. Documented in ChunkStatus.
+             Relies on LedgerPoint being idempotent - confirm this.
+
+ T2 (Medium) upsertAll does findById then save. save() on a composite-id entity without
+             @Version is likely a merge, adding a second SELECT per new row.
+             VALREPO L41-L53. Roughly 2 SELECT + 1 INSERT per new row, with no JDBC
+             batching configured. (verify with SQL logging)
+
+ T3 (Medium) The catalog upsert is one tx for all series. SERREPO L34. One malformed
+             series (for example a name longer than the column) rolls back all of them
+             and FAILs the job.
+
+ T4 (High)   markJobFinished overwrites the status unconditionally (JOBREPO L60-L66).
+             The reaper marks a job FAILED but cannot stop its threads (REAPER L41).
+             A healthy but slow job is marked FAILED, a second job of the same type can
+             start, the first job later flips its status to COMPLETED, and both can
+             publish the same series.
+
+ T5 (Low)    getJob reads job and tasks in two separate txs (JOBREPO L76). A transiently
+             inconsistent snapshot is possible.
+
+ T6 (Info)   No explicit locking or optimistic version on job or job_task. Safe today
+             because each task row has one writer. The only contention point is the
+             partial unique index on job.
+
+Recommendation: keep REQUIRED and READ COMMITTED. Make markJobFinished conditional
+(... WHERE status='RUNNING'). Add hibernate.jdbc.batch_size and order_inserts. Consider a
+native INSERT ... ON CONFLICT for series_value.
+
+
+--------------------------------------------------------------------------------
+4. LOGGING AND TRACEABILITY
+--------------------------------------------------------------------------------
+
+What works:
+  - MDC carries correlationId, jobId and seriesName, set at ORCH L116-L117 and
+    L188-L190, and removed in finally.
+  - The correlation ID goes to LedgerPoint as the X-Correlation-Id header (LP L111).
+  - Secrets are not logged (acceptance criterion 13).
+
+Example of a good trace:
+  cid=7c1e job=42 series=TYPE_A.PLANT_17 Task 903 failed: TARGET_REJECTED - ...
+
+Gaps:
+
+ L1 The filter accepts any header string, but the controller replaces a non-UUID one with
+    a new random UUID. The response header and request-thread logs then differ from the
+    job's ID and the one sent to LedgerPoint. FILTER L27-L31; CTRL L53-L61.
+
+ L2 A LedgerPoint 400 carries per-row errors (getErrors()), but only the generic message
+    is logged and persisted as failure_detail. Operators cannot see why a batch was
+    rejected. WORKER L116-L117; LedgerPointValidationException.
+
+ L3 Almost no INFO lifecycle logging: no job start/end summary, no task start or success
+    line, no chunk summary. Only SKIPPED logs at INFO (WORKER L152).
+
+ L4 TaskStatus has no RUNNING. started_at is set only at the first status write, so it
+    equals finished_at and duration is lost. In-flight tasks look PENDING.
+    TASKREPO L54-L68.
+
+ L5 Retry attempts are invisible. Only the 429 wait is logged (ORION L237). There is no
+    Resilience4j event consumer.
+
+ L6 The reaper logs a count only, not job IDs or types. REAPER L45.
+
+ L7 Orion calls do not carry the correlation ID. Only LedgerPoint does.
+
+ L8 fail() logs ex.getMessage() with no chunk range or stack. WORKER L312.
+
+Recommendation: validate the correlation header (UUID or reject) in the filter; log and
+persist a truncated validation error list; add INFO lines for job start/end, task
+start/end and per-chunk counts; add a RUNNING task status.
+
+
+--------------------------------------------------------------------------------
+5. ERROR HANDLING IN CONCURRENT MODE
+--------------------------------------------------------------------------------
+
+Layers:
+  (1) worker catch table, WORKER L106-L143
+  (2) ExecutionException fallback, ORCH L209-L214, plus markTaskInternalError L223
+  (3) failJobQuietly, ORCH L163
+  (4) the reaper
+Defence in depth is good, and there are tests for layers 1-3.
+
+Edge cases and holes:
+
+ a. fail() throws (DB down, or failure_detail exceeds VARCHAR(2000); ex.getMessage() is
+    unbounded and Hibernate messages can be long).
+    Result: the exception escapes process(). The fallback at ORCH L223 retries the same
+    write and fails the same way. It only logs, the task stays PENDING, and the job still
+    ends COMPLETED or COMPLETED_WITH_FAILURES because only FAILED tasks are counted.
+    Evidence: WORKER L311-L313; JobTaskEntity (failure_detail length 2000); ORCH L253.
+
+ b. A chunk fails and updateChunkStatus(FAILED) itself throws (for example DB down).
+    Result: the new exception replaces the original, which is lost (no addSuppressed).
+    A real TARGET_REJECTED becomes INTERNAL_ERROR with a DB message. WORKER L288-L291.
+
+ c. resolveWindow or a later step throws on the job thread, or createTask fails midway.
+    Result: job is FAILED but already-created tasks stay PENDING forever.
+    ORCH L146, L184, L163-L170.
+
+ d. Thread interrupted during invokeAll, or a future is cancelled.
+    Result: InterruptedException is handled at L216. CancellationException is unchecked
+    and not caught at L209 (only ExecutionException), so it would escape to
+    failJobQuietly. ORCH L204-L216.
+
+ e. One bad series in the catalog (length violation).
+    Result: the whole catalog tx rolls back and the job FAILs (see T3). SERREPO L34.
+
+ f. Orion returns a null value, or an unparseable startDate.
+    Result: NullPointerException or DateTimeParseException, mapped to INTERNAL_ERROR for
+    the whole series instead of a gap or warning. WORKER L137-L140.
+    (verify with a WireMock fixture)
+
+ g. Partial failure (chunk 5 of 12) after chunks 1-4 were sent and persisted.
+    Result: the task is FAILED with values_sent = 0 (WORKER L313), so the count is
+    misreported. The watermark is correctly untouched.
+
+ h. Retry on the LedgerPoint POST after a read timeout.
+    Result: the batch may be sent twice. Safe only if LedgerPoint is idempotent. LP L140.
+
+ i. JVM shutdown or restart mid-job.
+    Result: destroyMethod="shutdown" does not wait or interrupt. The job stays RUNNING and
+    the type's next sync returns 409 until the reaper fires (at least 2h).
+    VTCFG L29-L31.
+
+ j. Token invalidation herd: N tasks hit 401 on the same stale token and each calls
+    invalidate().
+    Result: a task that already received a fresh token may have it invalidated by a
+    late-arriving sibling, causing extra refreshes. ORION L88, L152; TOKEN L42.
+
+Recommendations:
+  1. Truncate failure_detail to 2000 characters. Use try/catch with addSuppressed for the
+     chunk FAILED update.
+  2. On job finalisation or failure, mark leftover PENDING tasks FAILED.
+  3. Compare-and-invalidate the token (invalidate only if the cached token equals the
+     stale one).
+  4. Catch CancellationException.
+  5. Treat a null Orion value as a gap or warning.
+
+
+--------------------------------------------------------------------------------
+6. MEMORY AND THREAD CONTEXT
+--------------------------------------------------------------------------------
+
+Context propagation: correct.
+  - Virtual threads are created per task and never pooled, so MDC cannot leak between
+    tasks. The finally blocks at ORCH L195-L197 and L125-L126 remove each key.
+  - Orion and LedgerPoint calls, Resilience4j retry and the rate limiter all run
+    synchronously on the same thread. correlationId, jobId and seriesName are therefore
+    visible at every step of the pipeline.
+  - Existing proof: workerRunsWithJobIdAndSeriesNameInTheLoggingContext
+    (SyncOrchestrationServiceTest L174).
+  - Not covered by MDC: the @Scheduled reaper thread, and the request thread's raw header
+    (see L1).
+
+Leak review:
+  Thread and task retention  No leak. Futures and callables live only while the job runs.
+  Executor shutdown          Fine. The first executor in VTCFG L19-L21 is an adapter over
+                             an unclosed virtual-thread executor. Harmless but redundant
+                             with spring.threads.virtual.enabled.
+  Micrometer tags            Bounded (status and failure-reason enums).
+  HTTP response bodies       Closed by RestClient, including in the onStatus handlers.
+  Rate limiter waiters       Threads park; nothing is queued as objects.
+  Peak heap                  Not a leak, but all N tasks start at once. Each holds a month
+                             of fetched, normalised and classified values plus
+                             findExistingValues. Heap scales with the number of concurrent
+                             tasks stalled on the DB pool or limiter. (load-test this)
+
+Concurrency risk - virtual-thread pinning:
+  TOKEN L35 and L42 use synchronized around a blocking HTTP login. On JDK 21 a virtual
+  thread blocked in or on a monitor pins its carrier thread. During a token refresh, up to
+  the number of CPU cores of carrier threads can be pinned for the connect and read
+  timeout (5s + 60s). All other virtual threads stall, including those doing DB work.
+  Use ReentrantLock.
+
+
+--------------------------------------------------------------------------------
+7. CONFIGURATION VALIDATION
+--------------------------------------------------------------------------------
+
+ [High]   orion.password: ${ORION_PASSWORD:} and ledgerpoint.api-key default to empty
+          (YML L25, L33). The app starts with no credentials and fails only at the first
+          call. Add @Validated + @NotBlank on the properties classes.
+
+ [Medium] Datasource password default (YML L13): a default password in the committed
+          file. Use an env-only value.
+
+ [High]   datasync.job.max-running-duration: PT2H (YML L46). At 5 calls per second,
+          3000 series x 12 chunks = about 7200 s, roughly 2h. A healthy large job is
+          reaped and a second one can start. Size the timeout from the call budget.
+
+ [Medium] exponential-backoff-multiplier: 2 (YML L64-L66) may be ignored unless
+          enable-exponential-backoff: true is set. (verify via the retry registry in an
+          IT). Tests build the config in code, so the YAML is untested.
+
+ [Medium] Rate limiter "orion" is per JVM (YML L54-L60). With two instances the effective
+          rate is 10/s. The unique job index prevents concurrent jobs of the same type only.
+
+ [Medium] No Hikari or JPA tuning: default pool of 10, no jdbc.batch_size, no
+          order_inserts, no explicit hibernate.jdbc.time_zone.
+
+ [Medium] No graceful shutdown (server.shutdown absent). See 5, i.
+
+ [Low]    Actuator and logging: no health probes configured, no endpoint security,
+          console-only text logs (no JSON for correlation search).
+
+ [OK]     ddl-auto: validate, open-in-view: false, Flyway on (YML L16-L19).
+
+ [Low]    pom.xml: resilience4j-all plus individual modules is redundant. No
+          maven-failsafe-plugin, which matters for section 8.
+
+
+--------------------------------------------------------------------------------
+8. TEST COVERAGE AND INTEGRATION-TEST PLAN
+--------------------------------------------------------------------------------
+
+8.1 Important finding
+
+The *IT classes are NOT run by "mvn test". target/surefire-reports has 17 reports and no
+*IT among them. SyncControllerIT (2 tests), JobRepositoryAdapterIT (2),
+SeriesRepositoryAdapterIT (1) and SeriesValueRepositoryAdapterIT (1) are therefore
+unexecuted, because surefire's default patterns do not match *IT and the pom has no
+failsafe plugin. The 112 passing tests are unit and acceptance tests only.
+
+8.2 Coverage matrix
+
+ Domain services (9 classes, 33 tests)   *ServiceTest
+     Gaps: good.
+
+ Worker (26 tests)                       SeriesSyncWorkerTest
+     Gaps: fail() throwing, chunk FAILED masking, null value or bad date, long
+     failure_detail, partial-chunk failure, concurrent abort mid-chunk.
+
+ Orchestration (12 tests)                SyncOrchestrationServiceTest
+     Gaps: real concurrency with many tasks, PENDING leftovers, cancellation, interrupt,
+     tasks created then window failure.
+
+ Orion adapter (12)                      OrionClientAdapterTest
+     Gaps: OrionTokenCache has NO test. Cover concurrent refresh, herd invalidation,
+     token endpoint 5xx and network error.
+
+ LedgerPoint adapter (9)                 LedgerPointClientAdapterTest
+     Gaps: read-timeout retry duplicates, 403, 5xx exhaustion.
+
+ Acceptance (13)                         AcceptanceCriteriaTest
+     Gaps: happy-path criteria only.
+
+ Web layer                               SyncControllerIT (not running)
+     Gaps: CorrelationIdFilter (no unit test), GlobalExceptionHandler mappings,
+     JobController, invalid header and date formats.
+
+ Persistence                             3 *IT classes (not running)
+     Gaps: TaskRepositoryAdapter, ChunkRepositoryAdapter, RuleOverrideRepositoryAdapter,
+     StaleJobReaper end-to-end, DB constraint violations.
+
+ Config                                  none
+     Gaps: YAML binding for Resilience4j and properties validation.
+
+8.3 Integration-test plan
+
+ Step 1  Enable the ITs. Add maven-failsafe-plugin (integration-test and verify goals) or
+         an explicit surefire include for *IT. Document the Docker requirement. CI runs
+         "mvn verify".
+
+ Step 2  Shared base class. Provide a singleton Timescale container with
+         @ServiceConnection (or DynamicPropertySource) and a shared WireMock. Clean tables
+         per test with @Sql or TRUNCATE. Use an application-it.yml with stale-check, rate
+         limits and backoff shortened.
+
+ Step 3  Happy path. Scenario from section 1: 3 series x 3 months. Assert the job, tasks
+         and chunks table content; series.unit, orion_call_count and last_synced_date;
+         series_value row counts; and the number of LedgerPoint POSTs.
+
+ Step 4  Idempotency. Re-run and assert zero POSTs. Change one value and assert exactly
+         one row is sent.
+
+ Step 5  Failure matrix with WireMock.
+           Orion: 401 mid-run (one refresh only), 429 with Retry-After, 5xx until retries
+                  are exhausted, null value, malformed date.
+           LedgerPoint: 400 (check persisted detail), 409, 401 (job aborts and siblings
+                  stop), 5xx.
+         Each gives the expected FailureReason and Job status.
+
+ Step 6  Concurrency. Run 200+ series with the rate limiter at the real value. Assert no
+         task is left PENDING; peak Orion call rate stays at or below 5/s; MDC values
+         appear in captured log lines (a log appender asserts cid, job and series on
+         every task line); there is no cross-task MDC bleed.
+
+ Step 7  Transaction and DB fault injection. Kill or pause the DB (Toxiproxy), force a
+         constraint failure, and use a very long error message. Assert the task and job
+         end states (verifies section 5 findings a-c).
+
+ Step 8  Reaper and lifecycle. Age a job past the cutoff and assert FAILED. Then trigger a
+         new job and assert the old job cannot overwrite its status (T4). Test shutdown
+         mid-job with graceful shutdown.
+
+ Step 9  Config IT. Boot with missing credentials and assert fail-fast (after adding
+         validation). Assert retryRegistry.retry("orion") has 3 attempts and the expected
+         interval function, and rateLimiterRegistry has limit 5 per 1s.
+
+ Step 10 API contract. Assert 202 + Location, 409, 400 and 404 bodies, and that the
+         X-Correlation-Id echoed in the response equals the job's stored ID (L1).
+
+
+--------------------------------------------------------------------------------
+9. PRIORITISED RECOMMENDATIONS (NOT APPLIED)
+--------------------------------------------------------------------------------
+
+ P0  Run the ITs in the build (8.3 step 1).
+ P0  Truncate failure_detail, and make fail() and the chunk FAILED update failure-safe
+     (5a, 5b). Mark leftover PENDING tasks FAILED on job close (5c).
+ P0  Reconcile the reaper timeout with job size, and make markJobFinished conditional
+     (T4, section 7).
+ P1  Replace synchronized in OrionTokenCache with ReentrantLock and compare-and-invalidate
+     (5j, section 6).
+ P1  Validate the correlation ID in the filter, and log and persist LedgerPoint
+     validation errors (L1, L2).
+ P1  Fail fast on blank credentials. Add Hikari and JDBC batching config. Enable graceful
+     shutdown.
+ P2  Add INFO lifecycle logs and a RUNNING task status. Log retry events. Handle null
+     Orion values as gaps. Pass the correlation ID to Orion.
+ P2  Batch or ON CONFLICT upserts for series_value. Reduce the catalog tx scope.

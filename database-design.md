@@ -141,7 +141,7 @@ One row per series within a job (spec §7.2).
 | `id` | `bigint` | PK, identity | |
 | `job_id` | `bigint` | FK → `job.id`, not null | |
 | `series_id` | `bigint` | FK → `series.id`, not null | |
-| `status` | `varchar(30)` | not null | `PENDING` \| `SUCCESS` \| `SUCCESS_WITH_WARNINGS` \| `SKIPPED` \| `FAILED` |
+| `status` | `varchar(30)` | not null | `PENDING` \| `RUNNING` \| `SUCCESS` \| `SUCCESS_WITH_WARNINGS` \| `SKIPPED` \| `FAILED` |
 | `failure_reason` | `varchar(50)` | nullable | one of the §8.1 codes: `SOURCE_UNAVAILABLE`, `NO_DATA`, `STALE_SERIES`, `UNSUPPORTED_GRANULARITY`, `UNSUPPORTED_TIMEZONE`, `TARGET_REJECTED`, `UNKNOWN_SERIES`, `TARGET_UNAVAILABLE`, `INTERNAL_ERROR` |
 | `failure_detail` | `varchar(2000)` | nullable | e.g. LedgerPoint 400 error body |
 | `values_sent` | `int` | not null, default 0 | |
@@ -259,7 +259,7 @@ No compression policy is configured for the POC (see `architecture.md` §9 "Scop
 | Enum | Values |
 |---|---|
 | `job.status` | `RUNNING`, `COMPLETED`, `COMPLETED_WITH_FAILURES`, `FAILED` |
-| `job_task.status` | `PENDING`, `SUCCESS`, `SUCCESS_WITH_WARNINGS`, `SKIPPED`, `FAILED` |
+| `job_task.status` | `PENDING`, `RUNNING`, `SUCCESS`, `SUCCESS_WITH_WARNINGS`, `SKIPPED`, `FAILED` |
 | `job_task.failure_reason` | `SOURCE_UNAVAILABLE`, `NO_DATA`, `STALE_SERIES`, `UNSUPPORTED_GRANULARITY`, `UNSUPPORTED_TIMEZONE`, `TARGET_REJECTED`, `UNKNOWN_SERIES`, `TARGET_UNAVAILABLE`, `INTERNAL_ERROR` |
 | `job_task_chunk.status` | `PENDING`, `FETCHED`, `TRANSFORMED`, `PUBLISHED`, `PERSISTED`, `FAILED` |
 | `task_warning.warning_type` | `GAP_MISSING`, `DST_SPRING_FORWARD_FILLED`, `DST_FALL_BACK_REPEATED` |

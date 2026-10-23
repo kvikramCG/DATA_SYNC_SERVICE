@@ -1,0 +1,67 @@
+TODO: STOP A CRASHED JOB FROM BLOCKING ITS SERIES TYPE
+======================================================
+
+PROBLEM
+-------
+If the process crashes while a job is running, its row stays RUNNING. The unique
+partial index uq_job_running_per_type (V1__init_schema.sql) then allows no new job
+of that series type, so every POST /api/series/{type}/sync returns 409.
+
+StaleJobReaper only closes a job when started_at is older than
+datasync.job.max-running-duration (default PT2H), checked every 5 minutes. So a
+crash can block the series type for up to about 2 hours 5 minutes.
+
+The same rule can also kill a healthy job that legitimately runs longer than 2 hours.
+
+RECOMMENDED FIX: HEARTBEAT (LEASE) ON THE JOB ROW
+-------------------------------------------------
+1. Schema
+   - New Flyway migration (V3): add nullable column job.last_heartbeat_at (timestamptz).
+
+2. Heartbeat writer
+   - Keep an in-memory set of job ids running in this JVM.
+   - Add the id at the start of SyncOrchestrationService.runJobInBackground and remove
+     it in the finally block.
+   - A scheduled task (about every 30 seconds) updates last_heartbeat_at for those ids
+     with a single bulk update.
+   - If the JVM dies the heartbeats stop, so no cleanup code is needed.
+
+3. Reaper rule
+   - Fail jobs where status = RUNNING and
+     coalesce(last_heartbeat_at, started_at) < now - threshold.
+   - Threshold: 3 to 5 minutes (several heartbeat intervals, tolerant of GC pauses
+     and short DB blips).
+   - Rows with no heartbeat fall back to started_at, so the migration and rolling
+     deploys are safe.
+   - Safe with several instances: a live instance keeps its own jobs fresh.
+
+4. Keep max-running-duration as a hard ceiling
+   - Still closes a job that is alive but hung.
+   - Consider raising it if real runs get longer.
+
+5. Reaper must also close the children
+   - failRunningJobsStartedBefore appears to update only job rows (to be confirmed).
+   - Also mark PENDING / RUNNING tasks (and non-terminal chunks) of reaped jobs as
+     FAILED with reason INTERNAL_ERROR, so GET /api/jobs/{id} is consistent.
+
+ALTERNATIVES CONSIDERED
+-----------------------
+- Fail all RUNNING jobs at startup: fast, but only safe with a single instance
+  (would kill another instance's live job). Could be added as well if the service
+  is guaranteed to run as one instance.
+- Lower max-running-duration only: risks killing legitimate long jobs and still
+  waits that long after a crash.
+- Admin endpoint to force-fail a job: a useful manual escape hatch, but it needs
+  an operator.
+
+TESTS TO ADD
+------------
+- Reaper fails a job with a stale heartbeat and leaves one with a fresh heartbeat.
+- Reaper falls back to started_at when last_heartbeat_at is null.
+- The heartbeat set is cleared when a job finishes normally and when it throws.
+- Reaping a job also fails its non-terminal tasks.
+
+OTHER GAP (NOT SOLVED BY THIS)
+------------------------------
+- Nothing links a re-run job to the failed job it replaces. Each POST creates a new
+  job with a new correlation id. Optional: add a nullable "retry_of_job_id" column.

@@ -15,6 +15,7 @@ import com.datasync.domain.model.ClassifiedSeriesValue;
 import com.datasync.domain.model.DateRange;
 import com.datasync.domain.model.FailureReason;
 import com.datasync.domain.model.LedgerPointPublishResult;
+import com.datasync.domain.model.LedgerPointValidationError;
 import com.datasync.domain.model.MissingInterval;
 import com.datasync.domain.model.NormalizedSeriesValue;
 import com.datasync.domain.model.SeriesDescriptor;
@@ -53,6 +54,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * Processes one series/Task end-to-end (spec &sect;3.1 steps 1-8, architecture.md "sync-engine"):
@@ -69,6 +71,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class SeriesSyncWorker {
 
     private static final Logger log = LoggerFactory.getLogger(SeriesSyncWorker.class);
+
+    /**
+     * Size of {@code job_task.failure_detail} (VARCHAR(2000)). A longer string would make the status
+     * UPDATE itself fail and leave the Task stuck RUNNING, so every detail is cut to fit.
+     */
+    private static final int MAX_FAILURE_DETAIL_LENGTH = 2000;
+    /** Row errors quoted in a TARGET_REJECTED detail: enough to diagnose, bounded so a 1,000-row 400 cannot flood it. */
+    private static final int MAX_ROW_ERRORS_IN_DETAIL = 5;
 
     private final SeriesSourcePort seriesSourcePort;
     private final SeriesValuePort seriesValuePort;
@@ -114,7 +124,9 @@ public class SeriesSyncWorker {
         } catch (UnsupportedTimeZoneException ex) {
             return fail(taskId, FailureReason.UNSUPPORTED_TIMEZONE, ex.getMessage());
         } catch (LedgerPointValidationException ex) {
-            return fail(taskId, FailureReason.TARGET_REJECTED, ex.getMessage());
+            // L2: LedgerPoint's 400 carries the per-row reasons; surface them instead of the bare
+            // "rejected the batch" message so an operator can see why without reproducing the call.
+            return fail(taskId, FailureReason.TARGET_REJECTED, describe(ex));
         } catch (LedgerPointUnknownSeriesException ex) {
             return fail(taskId, FailureReason.UNKNOWN_SERIES, ex.getMessage());
         } catch (LedgerPointTransientException ex) {
@@ -125,7 +137,7 @@ public class SeriesSyncWorker {
             // returned flag lets the caller mark the Job FAILED.
             jobAborted.set(true);
             taskRepositoryPort.updateTaskStatus(taskId, TaskStatus.FAILED, FailureReason.TARGET_UNAVAILABLE,
-                    ex.getMessage(), 0);
+                    safeDetail(ex.getMessage()), 0);
             return new TaskOutcome(TaskStatus.FAILED, true);
         } catch (OrionAuthException | OrionTransientException | OrionClientException ex) {
             return fail(taskId, FailureReason.SOURCE_UNAVAILABLE, ex.getMessage());
@@ -145,6 +157,10 @@ public class SeriesSyncWorker {
     private TaskOutcome processInternal(Long taskId, SeriesDescriptor series, LocalDate windowStart,
                                          LocalDate windowEnd, UUID correlationId, AtomicBoolean jobAborted) {
         throwIfAborted(jobAborted);
+
+        // L4: from here the Task is genuinely in flight. Recording RUNNING + started_at now (not at the
+        // final status write) keeps the real duration and lets a status query tell "queued" from "working".
+        taskRepositoryPort.markTaskStarted(taskId);
 
         Optional<SeriesRuleOverride> override =
                 ruleOverrideRepositoryPort.findActiveByOrionSeriesName(series.name());
@@ -217,6 +233,8 @@ public class SeriesSyncWorker {
     private ChunkResult processChunk(Long taskId, SeriesDescriptor series, String ledgerPointKey, DateRange chunk,
                                       UUID correlationId, AtomicBoolean jobAborted) {
         Long chunkId = chunkRepositoryPort.createChunk(taskId, chunk.start(), chunk.end());
+        // L8: the furthest stage this chunk completed, so a failure log says where it stopped.
+        ChunkStatus lastStage = ChunkStatus.PENDING;
         try {
             SeriesValuesResult fetched = seriesSourcePort.fetchValues(
                     series.name(), chunk.start().atStartOfDay(), chunk.end().atTime(23, 59, 59));
@@ -227,6 +245,7 @@ public class SeriesSyncWorker {
                 return new ChunkResult(0, 0, false, null);
             }
             chunkRepositoryPort.markChunkStage(chunkId, ChunkStatus.FETCHED);
+            lastStage = ChunkStatus.FETCHED;
             if (fetched.unit() != null && !fetched.unit().isBlank()) {
                 seriesRepositoryPort.updateUnit(series.id(), fetched.unit());
             }
@@ -263,6 +282,7 @@ public class SeriesSyncWorker {
             int unchangedCount = countByType(classified, ChangeType.UNCHANGED);
             metrics.valuesClassified(newCount, updatedCount, unchangedCount);
             chunkRepositoryPort.markChunkStage(chunkId, ChunkStatus.TRANSFORMED);
+            lastStage = ChunkStatus.TRANSFORMED;
 
             List<ClassifiedSeriesValue> toSend = classified.stream()
                     .filter(c -> c.changeType() != ChangeType.UNCHANGED)
@@ -279,6 +299,7 @@ public class SeriesSyncWorker {
                     ledgerPointBatchId = publishResult.batchIds().get(0);
                 }
                 chunkRepositoryPort.markChunkStage(chunkId, ChunkStatus.PUBLISHED);
+                lastStage = ChunkStatus.PUBLISHED;
 
                 // Persist only after LedgerPoint accepted the batch (spec §8 "Partial months").
                 List<NormalizedSeriesValue> toPersist = toSend.stream().map(ClassifiedSeriesValue::value).toList();
@@ -294,6 +315,11 @@ public class SeriesSyncWorker {
                     unchangedCount, toSend.size(), ledgerPointBatchId);
             return new ChunkResult(fetched.values().size(), toSend.size(), !gaps.isEmpty(), latestLocalDate);
         } catch (RuntimeException ex) {
+            // L8: say WHICH month failed and how far it got. Logged without a stack on purpose: expected
+            // failures (rejected batch, source down) are fully described by the exception text; the
+            // unexpected-bug path in process() already logs the full stack once at ERROR.
+            log.warn("Task {} chunk {}..{} failed after stage {}: {}",
+                    taskId, chunk.start(), chunk.end(), lastStage, ex.toString());
             chunkRepositoryPort.updateChunkStatus(chunkId, ChunkStatus.FAILED, 0, 0, 0, 0, null);
             throw ex;
         }
@@ -317,9 +343,43 @@ public class SeriesSyncWorker {
     }
 
     private TaskOutcome fail(Long taskId, FailureReason reason, String detail) {
-        log.warn("Task {} failed: {} - {}", taskId, reason, detail);
-        taskRepositoryPort.updateTaskStatus(taskId, TaskStatus.FAILED, reason, detail, 0);
+        String safe = safeDetail(detail);
+        log.warn("Task {} failed: {} - {}", taskId, reason, safe);
+        taskRepositoryPort.updateTaskStatus(taskId, TaskStatus.FAILED, reason, safe, 0);
         return new TaskOutcome(TaskStatus.FAILED, false);
+    }
+
+    /**
+     * Builds the TARGET_REJECTED detail from LedgerPoint's row errors, e.g.
+     * {@code LedgerPoint rejected the batch: [batch row 3 interval: must be 1..24; ...] (+12 more)}.
+     * {@code index} is the row's position inside the rejected batch, not inside the month.
+     */
+    private static String describe(LedgerPointValidationException ex) {
+        List<LedgerPointValidationError> errors = ex.getErrors();
+        if (errors == null || errors.isEmpty()) {
+            return ex.getMessage();
+        }
+        String shown = errors.stream()
+                .limit(MAX_ROW_ERRORS_IN_DETAIL)
+                .map(e -> "batch row " + e.index() + " " + e.field() + ": " + e.message())
+                .collect(Collectors.joining("; "));
+        int more = errors.size() - MAX_ROW_ERRORS_IN_DETAIL;
+        return ex.getMessage() + ": [" + shown + "]" + (more > 0 ? " (+" + more + " more)" : "");
+    }
+
+    /**
+     * Makes an externally-sourced message safe to log and store: control characters (newlines) are
+     * replaced so a hostile or malformed upstream message cannot forge extra log lines, and the text
+     * is cut to the column size so the status UPDATE cannot fail on length.
+     */
+    private static String safeDetail(String detail) {
+        if (detail == null) {
+            return null;
+        }
+        String clean = detail.replaceAll("\\p{Cntrl}", " ");
+        return clean.length() <= MAX_FAILURE_DETAIL_LENGTH
+                ? clean
+                : clean.substring(0, MAX_FAILURE_DETAIL_LENGTH - 3) + "...";
     }
 
     private record ChunkResult(int rawValuesSeen, int valuesSent, boolean hasWarnings, LocalDate latestLocalDate) {
