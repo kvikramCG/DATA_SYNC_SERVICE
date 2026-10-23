@@ -21,7 +21,17 @@ public interface JobRepositoryPort {
     Job createRunningJob(SeriesType type, String requestedSeriesName, Instant requestedStartDate,
                           Instant requestedEndDate, UUID correlationId);
 
-    void markJobFinished(Long jobId, JobStatus status);
+    /**
+     * Closes the job with the given terminal status, but only if it is still {@code RUNNING}
+     * (first close wins). The stale-job reaper can already have failed a slow job whose threads are
+     * still running; when that job later finishes it must not overwrite the reaper's verdict, lose
+     * the original {@code finishedAt}, or flip a status the caller may already have acted on.
+     *
+     * @return {@code true} if this call closed the job; {@code false} if it was already closed
+     *         (nothing was changed)
+     * @throws com.datasync.domain.exception.JobNotFoundException if no such job exists
+     */
+    boolean markJobFinished(Long jobId, JobStatus status);
 
     /**
      * Closes every job still {@code RUNNING} that started before {@code startedBefore} as

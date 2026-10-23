@@ -7,6 +7,8 @@ import com.datasync.domain.model.JobStatus;
 import com.datasync.domain.model.SeriesType;
 import com.datasync.domain.port.out.ClockPort;
 import com.datasync.domain.port.out.JobRepositoryPort;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,6 +26,8 @@ import java.util.UUID;
  */
 @Component
 public class JobRepositoryAdapter implements JobRepositoryPort {
+
+    private static final Logger log = LoggerFactory.getLogger(JobRepositoryAdapter.class);
 
     private final JobJpaRepository repository;
     private final ClockPort clock;
@@ -58,17 +62,31 @@ public class JobRepositoryAdapter implements JobRepositoryPort {
 
     @Override
     @Transactional
-    public void markJobFinished(Long jobId, JobStatus status) {
-        JobEntity entity = repository.findById(jobId)
-                .orElseThrow(() -> new JobNotFoundException("No job found with id " + jobId));
-        entity.setStatus(status.name());
-        entity.setFinishedAt(clock.now());
-        repository.save(entity);
+    public boolean markJobFinished(Long jobId, JobStatus status) {
+        // Previously this was findById + setStatus + save, which overwrote ANY status. That let a job
+        // the reaper had already failed flip back to COMPLETED when its threads finally ended.
+        // The conditional update below closes the row only if it is still RUNNING (first close wins).
+        int updated = repository.closeIfRunning(jobId, status.name(), clock.now());
+        if (updated == 1) {
+            return true;
+        }
+        // 0 rows is ambiguous: either the job does not exist or it was already closed. Keep the old
+        // contract for the first case (JobNotFoundException) and report the second as "not closed".
+        if (!repository.existsById(jobId)) {
+            throw new JobNotFoundException("No job found with id " + jobId);
+        }
+        return false;
     }
 
     @Override
     @Transactional
     public int failStaleRunningJobs(Instant startedBefore) {
+        // Same predicate as the bulk update below, read in the same transaction, so the logged jobs
+        // are the ones being failed. Gives operators the ids/correlation ids to search logs and
+        // LedgerPoint for; the previous log only had a count.
+        repository.findByStatusAndStartedAtBefore(JobStatus.RUNNING.name(), startedBefore)
+                .forEach(job -> log.warn("Failing stale job {} (type={}, startedAt={}, correlationId={})",
+                        job.getId(), job.getSeriesType(), job.getStartedAt(), job.getCorrelationId()));
         return repository.failRunningJobsStartedBefore(startedBefore, clock.now());
     }
 

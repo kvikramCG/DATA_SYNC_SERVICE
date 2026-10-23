@@ -489,7 +489,7 @@ class AcceptanceCriteriaTest {
         Map<TaskStatus, Integer> counts = new HashMap<>();
         detail.tasks().forEach(t -> counts.merge(t.status(), 1, Integer::sum));
         return new JobSummary(detail.jobId(), detail.seriesType(), detail.status(), started.startedAt(),
-                Instant.now(), counts);
+                Instant.now(), counts, detail.correlationId());
     }
 
     private Map<String, JobTask> tasksByName(JobSummary summary) {
@@ -595,10 +595,15 @@ class AcceptanceCriteriaTest {
         }
 
         @Override
-        public synchronized void markJobFinished(Long jobId, JobStatus status) {
+        public synchronized boolean markJobFinished(Long jobId, JobStatus status) {
             Job j = jobs.get(jobId);
+            // Mirrors the real adapter: first close wins, an already-closed job is left untouched.
+            if (j.status() != JobStatus.RUNNING) {
+                return false;
+            }
             jobs.put(jobId, new Job(j.id(), j.seriesType(), status, j.requestedSeriesName(),
                     j.requestedStartDate(), j.requestedEndDate(), j.startedAt(), NOW, j.correlationId()));
+            return true;
         }
 
         @Override

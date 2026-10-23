@@ -203,6 +203,9 @@ public class SeriesSyncWorker {
         seriesRepositoryPort.updateLastSyncedDate(series.id(), newLastSynced);
         TaskStatus finalStatus = anyWarnings ? TaskStatus.SUCCESS_WITH_WARNINGS : TaskStatus.SUCCESS;
         taskRepositoryPort.updateTaskStatus(taskId, finalStatus, null, null, totalValuesSent);
+        // Lifecycle log: task outcome (cid/job/series are added by the log pattern from MDC).
+        log.info("Task {} finished {}: valuesSent={}, window={}..{}",
+                taskId, finalStatus, totalValuesSent, windowStart, windowEnd);
         return new TaskOutcome(finalStatus, false);
     }
 
@@ -284,6 +287,11 @@ public class SeriesSyncWorker {
 
             chunkRepositoryPort.updateChunkStatus(chunkId, ChunkStatus.PERSISTED,
                     fetched.values().size(), newCount, updatedCount, unchangedCount, ledgerPointBatchId);
+            // Lifecycle log: one line per month-chunk with the counts and the LedgerPoint batch id,
+            // so a chunk can be matched to the LedgerPoint request carrying the same correlation id.
+            log.info("Task {} chunk {}..{} persisted: fetched={}, new={}, updated={}, unchanged={}, sent={}, batchId={}",
+                    taskId, chunk.start(), chunk.end(), fetched.values().size(), newCount, updatedCount,
+                    unchangedCount, toSend.size(), ledgerPointBatchId);
             return new ChunkResult(fetched.values().size(), toSend.size(), !gaps.isEmpty(), latestLocalDate);
         } catch (RuntimeException ex) {
             chunkRepositoryPort.updateChunkStatus(chunkId, ChunkStatus.FAILED, 0, 0, 0, 0, null);

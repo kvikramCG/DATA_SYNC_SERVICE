@@ -86,6 +86,9 @@ class SyncOrchestrationServiceTest {
         service = new SyncOrchestrationService(refreshSeriesCatalogUseCase, jobRepositoryPort, taskRepositoryPort,
                 seriesSyncWorker, executor, clock, metrics);
         lenient().when(jobRepositoryPort.createRunningJob(any(), any(), any(), any(), any())).thenReturn(runningJob);
+        // markJobFinished now returns whether this call closed the job; a bare mock would return false
+        // ("already closed") and every test would hit the rejected path, so default to the normal case.
+        lenient().when(jobRepositoryPort.markJobFinished(any(), any())).thenReturn(true);
         lenient().when(clock.now()).thenReturn(NOW);
     }
 
@@ -281,5 +284,22 @@ class SyncOrchestrationServiceTest {
         service.triggerSync(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
 
         verify(metrics, timeout(WAIT_MS)).jobFinished(SeriesType.TYPE_A, JobStatus.FAILED);
+    }
+
+    @Test
+    void alreadyClosedJobIsNotReportedInMetricsWhenTheCloseIsRejected() throws Exception {
+        // An empty catalog closes the job straight away (no tasks), so nothing else is submitted to
+        // the executor afterwards and we can wait for the background run to finish deterministically.
+        when(refreshSeriesCatalogUseCase.refreshCatalog(SeriesType.TYPE_A)).thenReturn(List.of());
+        // The reaper already closed this job: the port reports that nothing was changed.
+        when(jobRepositoryPort.markJobFinished(JOB_ID, JobStatus.COMPLETED)).thenReturn(false);
+
+        service.triggerSync(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+        executor.shutdown();
+        assertThat(executor.awaitTermination(WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)).isTrue();
+
+        verify(jobRepositoryPort).markJobFinished(JOB_ID, JobStatus.COMPLETED);
+        // The stored status was not changed, so no job outcome may be reported.
+        verify(metrics, never()).jobFinished(any(), any());
     }
 }

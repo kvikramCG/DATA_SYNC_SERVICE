@@ -14,6 +14,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -57,6 +58,90 @@ class SeriesValueRepositoryAdapterIT {
 
     @Autowired
     private SeriesRepositoryAdapter seriesRepositoryAdapter;
+
+    // Assertions read through plain SQL on purpose: the adapter now writes with native SQL, and a JPA
+    // read inside the same test transaction could return stale cached entities instead of the rows.
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    @Test
+    void existingRowIsUpdatedInPlaceAndKeepsItsLocalDate() {
+        Long seriesId = persistParentSeries();
+        Instant instant = Instant.parse("2026-11-01T07:00:00Z");
+        valueAdapter.upsertAll(seriesId, List.of(new NormalizedSeriesValue(
+                LocalDate.of(2026, 11, 1), "2", instant, false, new BigDecimal("29.80"))));
+
+        valueAdapter.upsertAll(seriesId, List.of(new NormalizedSeriesValue(
+                LocalDate.of(2026, 11, 1), "3", instant, false, new BigDecimal("30.10"))));
+
+        assertThat(countRows(seriesId)).isEqualTo(1);
+        Map<String, Object> row = jdbc.queryForMap(
+                "select value, interval_number, local_date from series_value where series_id = ?", seriesId);
+        assertThat((BigDecimal) row.get("value")).isEqualByComparingTo("30.10");
+        assertThat(row.get("interval_number")).isEqualTo("3");
+        assertThat(row.get("local_date").toString()).isEqualTo("2026-11-01");
+    }
+
+    @Test
+    void repeatedHourIsStoredAsASeparateRowFromTheSameInstant() {
+        Long seriesId = persistParentSeries();
+        Instant instant = Instant.parse("2026-11-01T07:00:00Z");
+
+        valueAdapter.upsertAll(seriesId, List.of(
+                new NormalizedSeriesValue(LocalDate.of(2026, 11, 1), "2", instant, false, new BigDecimal("29.80")),
+                new NormalizedSeriesValue(LocalDate.of(2026, 11, 1), "2", instant, true, new BigDecimal("29.10"))));
+
+        assertThat(countRows(seriesId)).isEqualTo(2);
+    }
+
+    @Test
+    void duplicateKeysInOneCallDoNotFailAndTheLastValueWins() {
+        Long seriesId = persistParentSeries();
+        Instant instant = Instant.parse("2026-11-01T07:00:00Z");
+
+        // Postgres would reject two rows with the same key in one INSERT ... ON CONFLICT statement.
+        valueAdapter.upsertAll(seriesId, List.of(
+                new NormalizedSeriesValue(LocalDate.of(2026, 11, 1), "2", instant, false, new BigDecimal("1.00")),
+                new NormalizedSeriesValue(LocalDate.of(2026, 11, 1), "2", instant, false, new BigDecimal("2.00"))));
+
+        assertThat(countRows(seriesId)).isEqualTo(1);
+        BigDecimal stored = jdbc.queryForObject(
+                "select value from series_value where series_id = ?", BigDecimal.class, seriesId);
+        assertThat(stored).isEqualByComparingTo("2.00");
+    }
+
+    @Test
+    void largeCallSpanningSeveralJdbcBatchesIsInsertedThenRewrittenWithoutDuplicates() {
+        Long seriesId = persistParentSeries();
+        // 2,500 hourly values = 3 JDBC batches (1,000 + 1,000 + 500).
+        Instant first = Instant.parse("2026-01-01T00:00:00Z");
+        List<NormalizedSeriesValue> values = new java.util.ArrayList<>();
+        for (int i = 0; i < 2_500; i++) {
+            Instant instant = first.plusSeconds(3600L * i);
+            values.add(new NormalizedSeriesValue(
+                    LocalDate.ofInstant(instant, java.time.ZoneOffset.UTC), "1", instant, false, BigDecimal.valueOf(i)));
+        }
+
+        valueAdapter.upsertAll(seriesId, values);
+        valueAdapter.upsertAll(seriesId, values); // idempotent re-run
+
+        assertThat(countRows(seriesId)).isEqualTo(2_500);
+    }
+
+    @Test
+    void emptyInputIsANoOp() {
+        Long seriesId = persistParentSeries();
+
+        valueAdapter.upsertAll(seriesId, List.of());
+
+        assertThat(countRows(seriesId)).isZero();
+    }
+
+    private int countRows(Long seriesId) {
+        Integer count = jdbc.queryForObject("select count(*) from series_value where series_id = ?",
+                Integer.class, seriesId);
+        return count == null ? 0 : count;
+    }
 
     @Test
     void upsertIsIdempotentAndFeedsChangeDetectorCorrectly() {

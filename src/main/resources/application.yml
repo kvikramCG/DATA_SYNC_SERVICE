@@ -11,6 +11,47 @@ spring:
     url: jdbc:postgresql://localhost:5432/datasync
     username: ${DB_USERNAME:datasync}
     password: ${DB_PASSWORD:datasync}
+    hikari:
+      # POOL SIZING DECISION. No transaction stays open during an Orion/LedgerPoint HTTP call
+      # (the worker is not @Transactional and open-in-view is off), so a connection is held only for
+      # the DB work itself. Orion is limited to 5 requests/s (resilience4j ratelimiter), so at most
+      # ~5 month-chunks per second reach the database. Needed connections ~ 5 x the hold time of the
+      # largest transaction (the batched value upsert, ~0.5-2 s) = about 3-10. 20 gives ~2x headroom
+      # for the API (POST/GET), the reaper and the two series types running together.
+      # A bigger pool adds database load, not throughput. Across all instances keep
+      # instances x pool below Postgres max_connections (default 100) minus admin/monitoring.
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      # Fixed-size pool (min = max): no cost of growing the pool in the middle of a burst.
+      minimum-idle: ${DB_POOL_SIZE:20}
+      # Fail fast. With batched writes a wait should be milliseconds; 30 s means the database is in
+      # trouble, and a longer timeout would only stack up blocked request/task threads.
+      connection-timeout: 30000
+      # Recycle connections before any network device can silently drop them. If a firewall, load
+      # balancer or pooler (e.g. PgBouncer) in front of Postgres closes idle connections sooner than
+      # this, set max-lifetime a few minutes BELOW its timeout.
+      max-lifetime: 1800000
+      # Periodic validation of idle connections so a dropped connection is replaced instead of
+      # being handed to a caller.
+      keepalive-time: 300000
+      # With batched writes no transaction should hold a connection for 30 s, so anything that does
+      # is a leak; Hikari logs a stack trace pointing at the code that took the connection.
+      leak-detection-threshold: 30000
+      pool-name: data-sync-hikari
+      # DRIVER OPTIONS are set here (not in the JDBC URL) so they still apply when the URL is
+      # overridden per environment, e.g. by SPRING_DATASOURCE_URL.
+      data-source-properties:
+        # Shows up in pg_stat_activity, so this service's connections can be told apart.
+        ApplicationName: data-sync-service
+        # Seconds. Do not wait forever for an unreachable database host.
+        connectTimeout: 10
+        # Seconds. A hung database cannot block a thread forever. Set well above the longest
+        # legitimate statement, including Flyway migrations that run on startup over this same
+        # datasource (e.g. an index build on a large table).
+        socketTimeout: 300
+        # Lets the driver merge batched single-row INSERTs into multi-row INSERTs (faster upserts).
+        # Purely a performance option: results are identical without it, and duplicate keys are
+        # already removed in SeriesValueRepositoryAdapter because multi-row ON CONFLICT rejects them.
+        reWriteBatchedInserts: true
   jpa:
     hibernate:
       ddl-auto: validate
@@ -87,4 +128,6 @@ management:
 
 logging:
   pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss} %-5level [cid=%X{correlationId} job=%X{jobId} series=%X{seriesName}] %logger{36} - %msg%n"
+    # cid defaults to n/a so a log line outside any request/job is visibly context-free instead of
+    # printing an empty "cid=".
+    console: "%d{yyyy-MM-dd HH:mm:ss} %-5level [cid=%X{correlationId:-n/a} job=%X{jobId} series=%X{seriesName}] %logger{36} - %msg%n"

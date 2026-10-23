@@ -1,6 +1,7 @@
 package com.datasync.adapter.out.persistence;
 
 import com.datasync.adapter.out.clock.SystemClockAdapter;
+import com.datasync.domain.exception.JobNotFoundException;
 import com.datasync.domain.model.Job;
 import com.datasync.domain.model.JobStatus;
 import com.datasync.domain.model.SeriesType;
@@ -20,6 +21,7 @@ import java.time.Instant;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Proves the stale-job reaper query against real Postgres: an orphaned RUNNING row is closed as
@@ -69,5 +71,41 @@ class JobRepositoryAdapterIT {
         // The unique partial index no longer blocks a new RUNNING job for the same type.
         Job next = adapter.createRunningJob(SeriesType.TYPE_B, null, null, null, UUID.randomUUID());
         assertThat(next.status()).isEqualTo(JobStatus.RUNNING);
+    }
+
+    @Test
+    void runningJobIsClosedWithTheGivenStatus() {
+        Job job = adapter.createRunningJob(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+
+        boolean closed = adapter.markJobFinished(job.id(), JobStatus.COMPLETED);
+
+        assertThat(closed).isTrue();
+        Job reloaded = adapter.findById(job.id()).orElseThrow();
+        assertThat(reloaded.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(reloaded.finishedAt()).isNotNull();
+    }
+
+    @Test
+    void jobFailedByTheReaperIsNotOverwrittenWhenItsThreadsLaterFinish() {
+        // The scenario behind first-close-wins: a slow job is reaped as FAILED, keeps running, and
+        // then tries to close itself as COMPLETED.
+        Job job = adapter.createRunningJob(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+        adapter.failStaleRunningJobs(Instant.now().plusSeconds(60));
+        Job reaped = adapter.findById(job.id()).orElseThrow();
+
+        boolean closed = adapter.markJobFinished(job.id(), JobStatus.COMPLETED);
+
+        assertThat(closed).isFalse();
+        Job reloaded = adapter.findById(job.id()).orElseThrow();
+        assertThat(reloaded.status()).isEqualTo(JobStatus.FAILED);
+        // The reaper's finishedAt is kept as well, so the audit trail is not rewritten.
+        assertThat(reloaded.finishedAt()).isEqualTo(reaped.finishedAt());
+    }
+
+    @Test
+    void closingAnUnknownJobStillThrowsNotFound() {
+        // 0 updated rows must not be mistaken for "already closed" when the job does not exist.
+        assertThatThrownBy(() -> adapter.markJobFinished(-1L, JobStatus.COMPLETED))
+                .isInstanceOf(JobNotFoundException.class);
     }
 }

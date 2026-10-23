@@ -14,7 +14,8 @@ public record JobSummaryResponse(
         String status,
         String startedAt,
         String finishedAt,
-        Map<String, Integer> taskCounts
+        Map<String, Integer> taskCounts,
+        String correlationId
 ) {
 
     public static JobSummaryResponse from(JobSummary summary) {
@@ -26,6 +27,7 @@ public record JobSummaryResponse(
                 summary.status().name(),
                 summary.startedAt() == null ? null : summary.startedAt().toString(),
                 summary.finishedAt() == null ? null : summary.finishedAt().toString(),
-                counts);
+                counts,
+                summary.correlationId() == null ? null : summary.correlationId().toString());
     }
 }

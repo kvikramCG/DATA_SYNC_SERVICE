@@ -108,7 +108,8 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
             failJobQuietly(job.id(), type, ex);
             throw ex;
         }
-        return new JobSummary(job.id(), type, JobStatus.RUNNING, job.startedAt(), null, Map.of());
+        // The id is returned to the caller so it can be quoted when asking about this job.
+        return new JobSummary(job.id(), type, JobStatus.RUNNING, job.startedAt(), null, Map.of(), correlationId);
     }
 
     private void runJobInBackground(Job job, SeriesType type, String seriesName, Instant startDate,
@@ -142,6 +143,10 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
             return;
         }
 
+        // Lifecycle log: start of the job (cid/job are added by the log pattern from MDC).
+        log.info("Sync job {} started: type={}, seriesFilter={}, targetSeries={}",
+                job.id(), type.wireValue(), seriesName, targets.size());
+
         List<JobTask> tasks = targets.stream()
                 .map(d -> taskRepositoryPort.createTask(job.id(), d.id(), d.name()))
                 .toList();
@@ -151,13 +156,28 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
         List<JobTask> finalTasks = taskRepositoryPort.findByJobId(job.id());
         finalTasks.forEach(t -> metrics.taskFinished(t.status(), t.failureReason()));
         Map<TaskStatus, Integer> taskCounts = countByStatus(finalTasks);
+        // Lifecycle log: per-status task totals, so a job's outcome is visible without querying the DB.
+        log.info("Sync job {} tasks finished: {}", job.id(), taskCounts);
         JobStatus finalStatus = determineFinalStatus(jobShouldFail, taskCounts);
         finishJob(job.id(), type, finalStatus);
     }
 
     private void finishJob(Long jobId, SeriesType type, JobStatus status) {
-        jobRepositoryPort.markJobFinished(jobId, status);
+        boolean closed = jobRepositoryPort.markJobFinished(jobId, status);
+        if (!closed) {
+            // The job was already closed - in practice by the stale-job reaper while this (slow but
+            // still running) job kept working. First close wins, so the stored status is left alone.
+            // We also skip the job metric and the "finished" log: the stored status differs from the
+            // one computed here, and the reaper path records no job metric, so emitting one would
+            // report an outcome that is not what the API returns. The WARN keeps the discrepancy
+            // visible (cid/job are added to the line from MDC).
+            log.warn("Sync job {} not closed as {}: it was already closed (likely reaped as stale); "
+                    + "keeping the stored status", jobId, status);
+            return;
+        }
         metrics.jobFinished(type, status);
+        // Lifecycle log: final job status (also reached via the failure and empty-job paths).
+        log.info("Sync job {} finished: type={}, status={}", jobId, type.wireValue(), status);
     }
 
     private void failJobQuietly(Long jobId, SeriesType type, RuntimeException cause) {
@@ -263,7 +283,8 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
         Job job = jobRepositoryPort.findById(jobId)
                 .orElseThrow(() -> new JobNotFoundException("No job found with id " + jobId));
         List<JobTask> tasks = taskRepositoryPort.findByJobId(jobId);
-        return new JobDetail(job.id(), job.seriesType(), job.status(), tasks);
+        // job.correlationId() is the value persisted at creation, so GET reports exactly what was logged/sent.
+        return new JobDetail(job.id(), job.seriesType(), job.status(), tasks, job.correlationId());
     }
 
     private Map<TaskStatus, Integer> countByStatus(List<JobTask> tasks) {

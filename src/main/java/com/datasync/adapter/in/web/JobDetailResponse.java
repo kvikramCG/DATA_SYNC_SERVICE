@@ -10,13 +10,15 @@ import java.util.List;
 public record JobDetailResponse(
         Long jobId,
         String status,
-        List<JobTaskResponse> tasks
+        List<JobTaskResponse> tasks,
+        String correlationId
 ) {
 
     public static JobDetailResponse from(JobDetail detail) {
         return new JobDetailResponse(
                 detail.jobId(),
                 detail.status().name(),
-                detail.tasks().stream().map(JobTaskResponse::from).toList());
+                detail.tasks().stream().map(JobTaskResponse::from).toList(),
+                detail.correlationId() == null ? null : detail.correlationId().toString());
     }
 }
