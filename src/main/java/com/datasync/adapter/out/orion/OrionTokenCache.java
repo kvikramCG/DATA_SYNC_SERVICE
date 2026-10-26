@@ -10,40 +10,74 @@ import org.springframework.web.client.RestClient;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Caches the Orion bearer token (valid 60 minutes per spec &sect;4) and refreshes it on
- * expiry or on demand ({@link #invalidate()} after a 401). Access is synchronized to avoid a
- * thundering herd of refresh calls from concurrently running series workers (ADR-004).
+ * expiry or on demand ({@link #invalidate(String)} after a 401). Only one thread refreshes at a time,
+ * so concurrently running series workers (ADR-004) do not stampede the login endpoint.
  */
 @Component
 public class OrionTokenCache {
 
     private static final Duration SAFETY_MARGIN = Duration.ofSeconds(60);
 
+    // Token and expiry travel together so a reader can never pair a new token with an old expiry.
+    private record CachedToken(String value, Instant expiresAt) {
+        boolean usable() {
+            return Instant.now().isBefore(expiresAt.minus(SAFETY_MARGIN));
+        }
+    }
+
     private final RestClient orionRestClient;
     private final OrionProperties properties;
 
-    private volatile String accessToken;
-    private volatile Instant expiresAt = Instant.EPOCH;
+    // ReentrantLock instead of synchronized: the login call below blocks on the network, and a virtual
+    // thread blocked inside synchronized pins its carrier thread (JDK 21), stalling unrelated tasks.
+    private final ReentrantLock refreshLock = new ReentrantLock();
+    private volatile CachedToken cached;
 
     public OrionTokenCache(RestClient orionRestClient, OrionProperties properties) {
         this.orionRestClient = orionRestClient;
         this.properties = properties;
     }
 
-    public synchronized String getToken() {
-        if (accessToken == null || Instant.now().isAfter(expiresAt.minus(SAFETY_MARGIN))) {
-            refresh();
+    public String getToken() {
+        CachedToken current = cached;
+        if (current != null && current.usable()) {
+            return current.value(); // fast path: no lock while the token is valid
         }
-        return accessToken;
+        refreshLock.lock();
+        try {
+            // Re-check: a thread ahead of us may already have refreshed while we waited for the lock.
+            current = cached;
+            if (current == null || !current.usable()) {
+                current = refresh();
+                cached = current;
+            }
+            return current.value();
+        } finally {
+            refreshLock.unlock();
+        }
     }
 
-    public synchronized void invalidate() {
-        accessToken = null;
+    /**
+     * Drops the cached token only if it is still {@code rejectedToken}. When many tasks get a 401 for the
+     * same stale token, the first one refreshes; the late ones must not throw that fresh token away.
+     */
+    public void invalidate(String rejectedToken) {
+        refreshLock.lock();
+        try {
+            CachedToken current = cached;
+            if (current != null && current.value().equals(rejectedToken)) {
+                cached = null;
+            }
+        } finally {
+            refreshLock.unlock();
+        }
     }
 
-    private void refresh() {
+    private CachedToken refresh() {
         OrionTokenResponse response = orionRestClient.post()
                 .uri("/auth/token")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -57,7 +91,6 @@ public class OrionTokenCache {
         if (response == null) {
             throw new OrionAuthException("Orion token response was empty");
         }
-        this.accessToken = response.accessToken();
-        this.expiresAt = Instant.now().plusSeconds(response.expiresInSeconds());
+        return new CachedToken(response.accessToken(), Instant.now().plusSeconds(response.expiresInSeconds()));
     }
 }

@@ -1,6 +1,8 @@
 package com.datasync.adapter.out.orion;
 
+import jakarta.validation.constraints.NotBlank;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
 
 import java.time.Duration;
 
@@ -8,10 +10,15 @@ import java.time.Duration;
  * Configuration for the Orion outbound adapter (spec &sect;4).
  */
 @ConfigurationProperties(prefix = "orion")
+// A blank value (e.g. ORION_PASSWORD unset, which application.yml defaults to "") must stop startup.
+@Validated
 public class OrionProperties {
 
+    @NotBlank
     private String baseUrl;
+    @NotBlank
     private String login;
+    @NotBlank
     private String password;
     private long connectTimeoutMs = 5000;
     private long readTimeoutMs = 60000;

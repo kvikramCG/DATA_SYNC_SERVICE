@@ -2,6 +2,7 @@ package com.datasync.application;
 
 import com.datasync.domain.exception.LedgerPointAuthException;
 import com.datasync.domain.exception.LedgerPointValidationException;
+import com.datasync.domain.exception.OrionTransientException;
 import com.datasync.domain.model.ChunkStatus;
 import com.datasync.domain.model.FailureReason;
 import com.datasync.domain.model.LedgerPointPublishResult;
@@ -249,6 +250,23 @@ class SeriesSyncWorkerTest {
                 eq(FailureReason.INTERNAL_ERROR), any(), eq(0));
         verify(chunkRepositoryPort).updateChunkStatus(eq(CHUNK_ID), eq(ChunkStatus.FAILED), eq(0), eq(0), eq(0),
                 eq(0), any());
+    }
+
+    @Test
+    void failingToRecordTheChunkAsFailedDoesNotReplaceTheOriginalFailureReason() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenThrow(new OrionTransientException("Orion is down"));
+        org.mockito.Mockito.doThrow(new IllegalStateException("database unavailable"))
+                .when(chunkRepositoryPort).updateChunkStatus(eq(CHUNK_ID), eq(ChunkStatus.FAILED), eq(0), eq(0),
+                        eq(0), eq(0), any());
+
+        TaskOutcome outcome = worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.FAILED);
+        // Still the Orion failure, not INTERNAL_ERROR from the database exception.
+        verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.FAILED),
+                eq(FailureReason.SOURCE_UNAVAILABLE), any(), eq(0));
     }
 
     @Test

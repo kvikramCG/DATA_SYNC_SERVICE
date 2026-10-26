@@ -320,7 +320,14 @@ public class SeriesSyncWorker {
             // unexpected-bug path in process() already logs the full stack once at ERROR.
             log.warn("Task {} chunk {}..{} failed after stage {}: {}",
                     taskId, chunk.start(), chunk.end(), lastStage, ex.toString());
-            chunkRepositoryPort.updateChunkStatus(chunkId, ChunkStatus.FAILED, 0, 0, 0, 0, null);
+            try {
+                chunkRepositoryPort.updateChunkStatus(chunkId, ChunkStatus.FAILED, 0, 0, 0, 0, null);
+            } catch (RuntimeException statusFailure) {
+                // The original failure picks the Task's failure reason; a failed audit write must not replace it.
+                ex.addSuppressed(statusFailure);
+                log.error("Task {} chunk {}..{}: could not record the chunk as FAILED",
+                        taskId, chunk.start(), chunk.end(), statusFailure);
+            }
             throw ex;
         }
     }
@@ -335,10 +342,12 @@ public class SeriesSyncWorker {
         }
     }
 
-    /** Raised at a checkpoint once another Task has hit a LedgerPoint authentication failure. */
+    /** Raised at a checkpoint once the job's abort flag is up (see {@link JobAbortRegistry}). */
     private static final class JobAbortedException extends RuntimeException {
         JobAbortedException() {
-            super("Job aborted: LedgerPoint authentication failed in another task", null, false, false);
+            // The flag is raised by a LedgerPoint auth failure, the stale-job reaper or shutdown, so the text names all three.
+            super("Job aborted before this task finished (LedgerPoint authentication failed, "
+                    + "the job was closed as stale, or the service is shutting down)", null, false, false);
         }
     }
 

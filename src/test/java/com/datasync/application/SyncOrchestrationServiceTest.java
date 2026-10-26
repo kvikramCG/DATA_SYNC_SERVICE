@@ -68,6 +68,7 @@ class SyncOrchestrationServiceTest {
     private SyncMetricsPort metrics;
 
     private ExecutorService executor;
+    private JobAbortRegistry abortRegistry;
     private SyncOrchestrationService service;
 
     private final Job runningJob = new Job(JOB_ID, SeriesType.TYPE_A, JobStatus.RUNNING, null, null, null,
@@ -83,8 +84,9 @@ class SyncOrchestrationServiceTest {
     @BeforeEach
     void setUp() {
         executor = Executors.newVirtualThreadPerTaskExecutor();
+        abortRegistry = new JobAbortRegistry();
         service = new SyncOrchestrationService(refreshSeriesCatalogUseCase, jobRepositoryPort, taskRepositoryPort,
-                seriesSyncWorker, executor, clock, metrics);
+                seriesSyncWorker, executor, clock, metrics, abortRegistry);
         lenient().when(jobRepositoryPort.createRunningJob(any(), any(), any(), any(), any())).thenReturn(runningJob);
         // markJobFinished now returns whether this call closed the job; a bare mock would return false
         // ("already closed") and every test would hit the rejected path, so default to the normal case.
@@ -301,5 +303,151 @@ class SyncOrchestrationServiceTest {
         verify(jobRepositoryPort).markJobFinished(JOB_ID, JobStatus.COMPLETED);
         // The stored status was not changed, so no job outcome may be reported.
         verify(metrics, never()).jobFinished(any(), any());
+    }
+
+    @Test
+    void tasksCreatedBeforeASetupFailureAreFailedInsteadOfLeftPending() {
+        SeriesDescriptor second = new SeriesDescriptor(
+                2L, "SERIES_BETA_002", SeriesType.TYPE_A, TimeZoneCode.CENTRAL,
+                LocalDateTime.of(2026, 10, 12, 18, 0), LocalDateTime.of(2020, 1, 1, 0, 0),
+                LocalDateTime.of(2026, 10, 13, 23, 0), null);
+        when(refreshSeriesCatalogUseCase.refreshCatalog(SeriesType.TYPE_A)).thenReturn(List.of(series, second));
+        when(taskRepositoryPort.createTask(JOB_ID, 1L, "SERIES_ALPHA_001")).thenReturn(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.PENDING, null, null, 0, null, null));
+        when(taskRepositoryPort.createTask(JOB_ID, 2L, "SERIES_BETA_002"))
+                .thenThrow(new IllegalStateException("database unavailable"));
+
+        service.triggerSync(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+
+        verify(taskRepositoryPort, timeout(WAIT_MS)).failUnfinishedTasks(eq(JOB_ID),
+                eq(FailureReason.INTERNAL_ERROR), any());
+        verify(jobRepositoryPort, timeout(WAIT_MS)).markJobFinished(JOB_ID, JobStatus.FAILED);
+    }
+
+    @Test
+    void tasksThatNeverReportedBackAreFailedBeforeTheJobCountsAreTaken() {
+        when(refreshSeriesCatalogUseCase.refreshCatalog(SeriesType.TYPE_A)).thenReturn(List.of(series));
+        when(taskRepositoryPort.createTask(JOB_ID, 1L, "SERIES_ALPHA_001")).thenReturn(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.PENDING, null, null, 0, null, null));
+        when(seriesSyncWorker.process(eq(7L), eq(series), any(), any(), any(), any()))
+                .thenReturn(new TaskOutcome(TaskStatus.SUCCESS, false));
+        when(taskRepositoryPort.findByJobId(JOB_ID)).thenReturn(List.of(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.FAILED, FailureReason.INTERNAL_ERROR,
+                        "Task did not finish before the job ended", 0, NOW, NOW)));
+
+        service.triggerSync(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+
+        verify(jobRepositoryPort, timeout(WAIT_MS)).markJobFinished(JOB_ID, JobStatus.COMPLETED_WITH_FAILURES);
+        var order = org.mockito.Mockito.inOrder(taskRepositoryPort);
+        order.verify(taskRepositoryPort).failUnfinishedTasks(eq(JOB_ID), eq(FailureReason.INTERNAL_ERROR), any());
+        order.verify(taskRepositoryPort).findByJobId(JOB_ID);
+    }
+
+    @Test
+    void anAbortRaisedFromOutsideEndsTheJobFailedNotWithFailures() {
+        when(refreshSeriesCatalogUseCase.refreshCatalog(SeriesType.TYPE_A)).thenReturn(List.of(series));
+        when(taskRepositoryPort.createTask(JOB_ID, 1L, "SERIES_ALPHA_001")).thenReturn(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.PENDING, null, null, 0, null, null));
+        // Stands in for the reaper: raises the job's flag while the worker is running.
+        when(seriesSyncWorker.process(eq(7L), eq(series), any(), any(), any(), any())).thenAnswer(inv -> {
+            abortRegistry.abort(JOB_ID);
+            return new TaskOutcome(TaskStatus.FAILED, false);
+        });
+        when(taskRepositoryPort.findByJobId(JOB_ID)).thenReturn(List.of(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.FAILED, FailureReason.TARGET_UNAVAILABLE,
+                        "Job aborted", 0, NOW, NOW)));
+
+        service.triggerSync(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+
+        verify(jobRepositoryPort, timeout(WAIT_MS)).markJobFinished(JOB_ID, JobStatus.FAILED);
+    }
+
+    @Test
+    void shutdownTellsRunningJobsToStopAndWaitsForThemToClose() throws Exception {
+        CountDownLatch workerStarted = new CountDownLatch(1);
+        when(refreshSeriesCatalogUseCase.refreshCatalog(SeriesType.TYPE_A)).thenReturn(List.of(series));
+        when(taskRepositoryPort.createTask(JOB_ID, 1L, "SERIES_ALPHA_001")).thenReturn(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.PENDING, null, null, 0, null, null));
+        // The worker only returns once the abort flag is raised, like a real worker stopping at a checkpoint.
+        when(seriesSyncWorker.process(eq(7L), eq(series), any(), any(), any(), any())).thenAnswer(inv -> {
+            AtomicBoolean flag = inv.getArgument(5);
+            workerStarted.countDown();
+            while (!flag.get()) {
+                Thread.sleep(10);
+            }
+            return new TaskOutcome(TaskStatus.FAILED, false);
+        });
+        when(taskRepositoryPort.findByJobId(JOB_ID)).thenReturn(List.of(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.FAILED, FailureReason.TARGET_UNAVAILABLE,
+                        "Job aborted", 0, NOW, NOW)));
+
+        service.triggerSync(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+        assertThat(workerStarted.await(WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)).isTrue();
+
+        service.shutdown();
+
+        // shutdown() returns only after the job unregistered, i.e. after it was closed.
+        verify(jobRepositoryPort).markJobFinished(JOB_ID, JobStatus.FAILED);
+    }
+
+    @Test
+    void aCancelledTaskFutureFailsThatTaskInsteadOfAbortingTheJobRun() {
+        // invokeAll normally never hands back a cancelled future, so this executor does it on purpose.
+        ExecutorService cancelling = new java.util.concurrent.AbstractExecutorService() {
+            @Override
+            public void shutdown() {
+            }
+
+            @Override
+            public List<Runnable> shutdownNow() {
+                return List.of();
+            }
+
+            @Override
+            public boolean isShutdown() {
+                return false;
+            }
+
+            @Override
+            public boolean isTerminated() {
+                return false;
+            }
+
+            @Override
+            public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) {
+                return true;
+            }
+
+            @Override
+            public void execute(Runnable command) {
+                Thread.ofVirtual().start(command);
+            }
+
+            @Override
+            public <T> List<java.util.concurrent.Future<T>> invokeAll(
+                    java.util.Collection<? extends java.util.concurrent.Callable<T>> tasks) {
+                List<java.util.concurrent.Future<T>> futures = new ArrayList<>();
+                for (java.util.concurrent.Callable<T> task : tasks) {
+                    java.util.concurrent.FutureTask<T> future = new java.util.concurrent.FutureTask<>(task);
+                    future.cancel(true);
+                    futures.add(future);
+                }
+                return futures;
+            }
+        };
+        service = new SyncOrchestrationService(refreshSeriesCatalogUseCase, jobRepositoryPort, taskRepositoryPort,
+                seriesSyncWorker, cancelling, clock, metrics, abortRegistry);
+        when(refreshSeriesCatalogUseCase.refreshCatalog(SeriesType.TYPE_A)).thenReturn(List.of(series));
+        when(taskRepositoryPort.createTask(JOB_ID, 1L, "SERIES_ALPHA_001")).thenReturn(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.PENDING, null, null, 0, null, null));
+        when(taskRepositoryPort.findByJobId(JOB_ID)).thenReturn(List.of(
+                new JobTask(7L, JOB_ID, 1L, "SERIES_ALPHA_001", TaskStatus.FAILED, FailureReason.INTERNAL_ERROR,
+                        "CancellationException", 0, NOW, NOW)));
+
+        service.triggerSync(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
+
+        verify(taskRepositoryPort, timeout(WAIT_MS)).updateTaskStatus(7L, TaskStatus.FAILED,
+                FailureReason.INTERNAL_ERROR, "CancellationException", 0);
+        verify(jobRepositoryPort, timeout(WAIT_MS)).markJobFinished(JOB_ID, JobStatus.COMPLETED_WITH_FAILURES);
     }
 }

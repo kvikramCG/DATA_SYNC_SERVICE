@@ -15,6 +15,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -80,14 +81,16 @@ public class JobRepositoryAdapter implements JobRepositoryPort {
 
     @Override
     @Transactional
-    public int failStaleRunningJobs(Instant startedBefore) {
+    public List<Long> failStaleRunningJobs(Instant startedBefore) {
         // Same predicate as the bulk update below, read in the same transaction, so the logged jobs
         // are the ones being failed. Gives operators the ids/correlation ids to search logs and
         // LedgerPoint for; the previous log only had a count.
-        repository.findByStatusAndStartedAtBefore(JobStatus.RUNNING.name(), startedBefore)
-                .forEach(job -> log.warn("Failing stale job {} (type={}, startedAt={}, correlationId={})",
-                        job.getId(), job.getSeriesType(), job.getStartedAt(), job.getCorrelationId()));
-        return repository.failRunningJobsStartedBefore(startedBefore, clock.now());
+        List<JobEntity> stale = repository.findByStatusAndStartedAtBefore(JobStatus.RUNNING.name(), startedBefore);
+        stale.forEach(job -> log.warn("Failing stale job {} (type={}, startedAt={}, correlationId={})",
+                job.getId(), job.getSeriesType(), job.getStartedAt(), job.getCorrelationId()));
+        repository.failRunningJobsStartedBefore(startedBefore, clock.now());
+        // The caller needs the ids to stop these jobs' workers and fail their unfinished Tasks.
+        return stale.stream().map(JobEntity::getId).toList();
     }
 
     @Override

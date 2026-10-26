@@ -29,4 +29,12 @@ public interface TaskRepositoryPort {
      */
     void updateTaskStatus(Long taskId, TaskStatus status, FailureReason failureReason,
                            String failureDetail, int valuesSent);
+
+    /**
+     * Fails every Task of the job that is still {@code PENDING} or {@code RUNNING}. Used when a job ends
+     * (or is closed by the reaper) so no Task stays "waiting" or "running" on a finished job.
+     *
+     * @return the number of Tasks changed
+     */
+    int failUnfinishedTasks(Long jobId, FailureReason failureReason, String failureDetail);
 }

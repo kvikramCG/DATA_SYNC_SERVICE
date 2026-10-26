@@ -18,6 +18,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -51,9 +52,9 @@ class JobRepositoryAdapterIT {
     void recentRunningJobIsLeftAlone() {
         Job job = adapter.createRunningJob(SeriesType.TYPE_A, null, null, null, UUID.randomUUID());
 
-        int failed = adapter.failStaleRunningJobs(Instant.now().minusSeconds(3600));
+        List<Long> failed = adapter.failStaleRunningJobs(Instant.now().minusSeconds(3600));
 
-        assertThat(failed).isZero();
+        assertThat(failed).isEmpty();
         assertThat(adapter.findById(job.id()).orElseThrow().status()).isEqualTo(JobStatus.RUNNING);
     }
 
@@ -61,9 +62,9 @@ class JobRepositoryAdapterIT {
     void staleRunningJobIsFailedAndNoLongerBlocksTheSeriesType() {
         Job stale = adapter.createRunningJob(SeriesType.TYPE_B, null, null, null, UUID.randomUUID());
 
-        int failed = adapter.failStaleRunningJobs(Instant.now().plusSeconds(60));
+        List<Long> failed = adapter.failStaleRunningJobs(Instant.now().plusSeconds(60));
 
-        assertThat(failed).isEqualTo(1);
+        assertThat(failed).containsExactly(stale.id());
         Job reloaded = adapter.findById(stale.id()).orElseThrow();
         assertThat(reloaded.status()).isEqualTo(JobStatus.FAILED);
         assertThat(reloaded.finishedAt()).isNotNull();

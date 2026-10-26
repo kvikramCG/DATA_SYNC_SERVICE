@@ -6,6 +6,9 @@ import com.datasync.domain.model.SeriesType;
 import com.datasync.domain.model.TimeZoneCode;
 import com.datasync.domain.port.out.ClockPort;
 import com.datasync.domain.port.out.SeriesRepositoryPort;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -22,6 +25,8 @@ import java.util.List;
 @Component
 public class SeriesRepositoryAdapter implements SeriesRepositoryPort {
 
+    private static final Logger log = LoggerFactory.getLogger(SeriesRepositoryAdapter.class);
+
     private final SeriesJpaRepository repository;
     private final ClockPort clock;
 
@@ -31,33 +36,42 @@ public class SeriesRepositoryAdapter implements SeriesRepositoryPort {
     }
 
     @Override
-    @Transactional
+    // Deliberately NOT @Transactional: each series commits on its own (repository calls are transactional
+    // by themselves), so one rejected row (e.g. a name longer than the column) cannot roll back the rest.
     public List<SeriesDescriptor> upsertAll(List<SeriesDescriptor> descriptors) {
         Instant now = clock.now();
         List<SeriesDescriptor> persisted = new ArrayList<>(descriptors.size());
         for (SeriesDescriptor descriptor : descriptors) {
-            SeriesEntity entity = repository.findByName(descriptor.name())
-                    .orElseGet(() -> new SeriesEntity(
-                            descriptor.name(),
-                            descriptor.type().wireValue(),
-                            descriptor.orionTimeZoneCode(),
-                            now,
-                            now));
-
-            entity.setTimeZoneCode(descriptor.orionTimeZoneCode());
-            entity.setEarliestDataDate(descriptor.earliestDataDate() == null
-                    ? null : descriptor.earliestDataDate().toLocalDate());
-            entity.setLatestDataDate(descriptor.latestDataDate() == null
-                    ? null : descriptor.latestDataDate().toLocalDate());
-            // Without a supported timezone the local timestamp cannot be turned into an instant.
-            entity.setLastUpdatedDate(descriptor.lastUpdatedDate() == null || descriptor.timeZone() == null
-                    ? null : descriptor.lastUpdatedDate().atZone(ZoneId.of(descriptor.timeZone().ianaZoneId())).toInstant());
-            entity.setUpdatedAt(now);
-
-            SeriesEntity saved = repository.save(entity);
-            persisted.add(toDomain(saved));
+            try {
+                persisted.add(upsertOne(descriptor, now));
+            } catch (DataAccessException ex) {
+                // The series is left out of the result, so it gets no Task this run; the others proceed.
+                log.error("Skipping series '{}': it could not be saved to the catalog", descriptor.name(), ex);
+            }
         }
         return persisted;
+    }
+
+    private SeriesDescriptor upsertOne(SeriesDescriptor descriptor, Instant now) {
+        SeriesEntity entity = repository.findByName(descriptor.name())
+                .orElseGet(() -> new SeriesEntity(
+                        descriptor.name(),
+                        descriptor.type().wireValue(),
+                        descriptor.orionTimeZoneCode(),
+                        now,
+                        now));
+
+        entity.setTimeZoneCode(descriptor.orionTimeZoneCode());
+        entity.setEarliestDataDate(descriptor.earliestDataDate() == null
+                ? null : descriptor.earliestDataDate().toLocalDate());
+        entity.setLatestDataDate(descriptor.latestDataDate() == null
+                ? null : descriptor.latestDataDate().toLocalDate());
+        // Without a supported timezone the local timestamp cannot be turned into an instant.
+        entity.setLastUpdatedDate(descriptor.lastUpdatedDate() == null || descriptor.timeZone() == null
+                ? null : descriptor.lastUpdatedDate().atZone(ZoneId.of(descriptor.timeZone().ianaZoneId())).toInstant());
+        entity.setUpdatedAt(now);
+
+        return toDomain(repository.save(entity));
     }
 
     @Override

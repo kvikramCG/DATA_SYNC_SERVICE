@@ -1,14 +1,20 @@
 package com.datasync.adapter.out.ledgerpoint;
 
+import jakarta.validation.constraints.NotBlank;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * Configuration for the LedgerPoint outbound adapter (spec &sect;5).
  */
 @ConfigurationProperties(prefix = "ledgerpoint")
+// A blank value (e.g. LEDGERPOINT_API_KEY unset, which application.yml defaults to "") must stop startup.
+@Validated
 public class LedgerPointProperties {
 
+    @NotBlank
     private String baseUrl;
+    @NotBlank
     private String apiKey;
     private long connectTimeoutMs = 5000;
     private long readTimeoutMs = 60000;

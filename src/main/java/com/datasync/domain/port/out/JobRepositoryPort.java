@@ -5,6 +5,7 @@ import com.datasync.domain.model.JobStatus;
 import com.datasync.domain.model.SeriesType;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -38,9 +39,9 @@ public interface JobRepositoryPort {
      * {@link JobStatus#FAILED}. Orphaned RUNNING rows (process crash, unexpected failure) would
      * otherwise block every later sync of that series type via the unique partial index.
      *
-     * @return the number of jobs closed
+     * @return the ids of the jobs closed, so the caller can stop their workers and fail their Tasks
      */
-    int failStaleRunningJobs(Instant startedBefore);
+    List<Long> failStaleRunningJobs(Instant startedBefore);
 
     Optional<Job> findById(Long jobId);
 }

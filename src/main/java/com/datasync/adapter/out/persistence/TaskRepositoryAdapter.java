@@ -81,6 +81,12 @@ public class TaskRepositoryAdapter implements TaskRepositoryPort {
         repository.save(entity);
     }
 
+    @Override
+    @Transactional
+    public int failUnfinishedTasks(Long jobId, FailureReason failureReason, String failureDetail) {
+        return repository.failUnfinishedByJobId(jobId, failureReason.name(), failureDetail, clock.now());
+    }
+
     private JobTask toDomain(JobTaskEntity entity, String seriesName) {
         return new JobTask(
                 entity.getId(),

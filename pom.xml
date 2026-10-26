@@ -42,6 +42,11 @@
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
+        <!-- Item 3: enables @Validated on @ConfigurationProperties so blank credentials stop the app at startup. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.postgresql</groupId>
@@ -62,21 +67,12 @@
             <artifactId>resilience4j-spring-boot3</artifactId>
             <version>${resilience4j.version}</version>
         </dependency>
+        <!-- Provides Decorators and brings retry and ratelimiter in transitively, so those two are not listed. -->
         <dependency>
             <groupId>io.github.resilience4j</groupId>
-            <artifactId>resilience4j-retry</artifactId>
+            <artifactId>resilience4j-all</artifactId>
             <version>${resilience4j.version}</version>
         </dependency>
-        <dependency>
-            <groupId>io.github.resilience4j</groupId>
-            <artifactId>resilience4j-ratelimiter</artifactId>
-            <version>${resilience4j.version}</version>
-        </dependency>
-        <dependency>
-    <groupId>io.github.resilience4j</groupId>
-    <artifactId>resilience4j-all</artifactId>
-    <version>${resilience4j.version}</version>
-</dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -124,6 +120,25 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <!-- Item 4: surefire (mvn test) skips *IT classes, so without this plugin they never ran.
+                 Run them with `mvn verify`; they need Docker for Testcontainers. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <!-- Without this failsafe puts the repackaged Spring Boot fat jar on the classpath, where
+                         the ITs cannot find the application classes (they sit under BOOT-INF/classes). -->
+                    <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

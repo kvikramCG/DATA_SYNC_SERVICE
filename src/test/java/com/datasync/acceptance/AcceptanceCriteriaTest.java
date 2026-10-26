@@ -11,6 +11,7 @@ import com.datasync.adapter.out.orion.OrionClientAdapter;
 import com.datasync.adapter.out.orion.OrionDateFormat;
 import com.datasync.adapter.out.orion.OrionProperties;
 import com.datasync.adapter.out.orion.OrionTokenCache;
+import com.datasync.application.JobAbortRegistry;
 import com.datasync.application.SeriesCatalogService;
 import com.datasync.application.SeriesSyncWorker;
 import com.datasync.application.SyncOrchestrationService;
@@ -85,9 +86,11 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathMatching;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Executable form of spec &sect;11 "Acceptance Criteria", one test per criterion. The real Orion and
+ * Executable form of spec &sect;11 "Acceptance Criteria" (one happy-path test per criterion) plus the
+ * failure and edge cases of &sect;5, &sect;6 and &sect;8 below them. The real Orion and
  * LedgerPoint adapters, {@link SeriesSyncWorker} and {@link SyncOrchestrationService} run
  * end-to-end against WireMock; only persistence is replaced by in-memory fakes so the suite needs
  * neither Docker nor a database.
@@ -112,6 +115,7 @@ class AcceptanceCriteriaTest {
     private InMemoryStore store;
     private AtomicReference<Instant> now;
     private ExecutorService executor;
+    private LedgerPointProperties ledgerPointProperties;
     private SyncOrchestrationService service;
 
     @BeforeEach
@@ -129,7 +133,7 @@ class AcceptanceCriteriaTest {
         orionProperties.setConnectTimeoutMs(2000);
         orionProperties.setReadTimeoutMs(5000);
 
-        LedgerPointProperties ledgerPointProperties = new LedgerPointProperties();
+        ledgerPointProperties = new LedgerPointProperties();
         ledgerPointProperties.setBaseUrl(wireMock.baseUrl());
         ledgerPointProperties.setApiKey(LEDGERPOINT_KEY);
         ledgerPointProperties.setConnectTimeoutMs(2000);
@@ -161,7 +165,7 @@ class AcceptanceCriteriaTest {
         SeriesSyncWorker worker = new SeriesSyncWorker(orion, store, ledgerPoint, store, store, store, store,
                 clock, metrics, 5);
         service = new SyncOrchestrationService(new SeriesCatalogService(orion, store), store, store, worker,
-                executor, clock, metrics);
+                executor, clock, metrics, new JobAbortRegistry());
 
         wireMock.stubFor(post(urlEqualTo("/auth/token")).willReturn(okJson(
                 "{\"accessToken\":\"" + ORION_TOKEN + "\",\"expiresInSeconds\":3600}")));
@@ -460,6 +464,474 @@ class AcceptanceCriteriaTest {
         }
     }
 
+    // ---------------------------------------------------------------- failure and edge cases
+
+    @Test
+    void failure08_orion429OnEveryAttemptExhaustsTheRetriesAndFailsOnlyThatTask() {
+        stubSeriesList("SERIES_ALPHA_001", "SERIES_BETA_002");
+        String alphaUrl = "/v1/series/SERIES_ALPHA_001/values";
+        wireMock.stubFor(get(urlPathEqualTo(alphaUrl)).willReturn(aResponse().withStatus(429)));
+        stubValues("SERIES_BETA_002", valuesBody("SERIES_BETA_002", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "40.00")));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        Map<String, JobTask> tasks = tasksByName(summary);
+        assertThat(tasks.get("SERIES_ALPHA_001").status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(tasks.get("SERIES_ALPHA_001").failureReason()).isEqualTo(FailureReason.SOURCE_UNAVAILABLE);
+        assertThat(tasks.get("SERIES_BETA_002").status()).isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED_WITH_FAILURES);
+        wireMock.verify(3, getRequestedFor(urlPathEqualTo(alphaUrl))); // three attempts, then give up
+    }
+
+    @Test
+    void failure09_orion401AfterTheTokenRefreshFailsTheTaskInsteadOfLooping() {
+        stubSeriesList("SERIES_ALPHA_001");
+        String url = "/v1/series/SERIES_ALPHA_001/values";
+        wireMock.stubFor(get(urlPathEqualTo(url)).willReturn(aResponse().withStatus(401)));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.SOURCE_UNAVAILABLE);
+        wireMock.verify(2, getRequestedFor(urlPathEqualTo(url)));        // the 401 and exactly one retry
+        wireMock.verify(2, postRequestedFor(urlEqualTo("/auth/token"))); // first login and exactly one refresh
+        wireMock.verify(0, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+    }
+
+    @Test
+    void failure_orion404ForOneSeriesIsNotRetriedAndDoesNotStopTheOthers() {
+        stubSeriesList("SERIES_ALPHA_001", "SERIES_BETA_002");
+        String alphaUrl = "/v1/series/SERIES_ALPHA_001/values";
+        wireMock.stubFor(get(urlPathEqualTo(alphaUrl)).willReturn(aResponse().withStatus(404)));
+        stubValues("SERIES_BETA_002", valuesBody("SERIES_BETA_002", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "40.00")));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        Map<String, JobTask> tasks = tasksByName(summary);
+        assertThat(tasks.get("SERIES_ALPHA_001").status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(tasks.get("SERIES_ALPHA_001").failureReason()).isEqualTo(FailureReason.SOURCE_UNAVAILABLE);
+        assertThat(tasks.get("SERIES_BETA_002").status()).isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED_WITH_FAILURES);
+        wireMock.verify(1, getRequestedFor(urlPathEqualTo(alphaUrl))); // a 404 is never retried
+    }
+
+    @Test
+    void failure_orionSeriesListDownFailsTheJobWithoutCreatingTasksOrPosting() {
+        wireMock.stubFor(get(urlPathEqualTo("/v1/series")).willReturn(aResponse().withStatus(503)));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        assertThat(summary.status()).isEqualTo(JobStatus.FAILED);
+        assertThat(store.findByJobId(summary.jobId())).isEmpty();
+        wireMock.verify(3, getRequestedFor(urlPathEqualTo("/v1/series")));
+        wireMock.verify(0, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+    }
+
+    @Test
+    void failure10_ledgerPoint409FailsWithUnknownSeriesAndIsNotRetried() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1).willReturn(aResponse().withStatus(409)));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.UNKNOWN_SERIES);
+        wireMock.verify(1, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+    }
+
+    @Test
+    void failure10_ledgerPoint5xxOnEveryAttemptFailsWithTargetUnavailableAfterThreeTries() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1).willReturn(aResponse().withStatus(503)));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.TARGET_UNAVAILABLE);
+        wireMock.verify(3, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+        assertThat(store.chunkStatuses()).containsExactly(ChunkStatus.FAILED);
+    }
+
+    @Test
+    void failure10_ledgerPoint400DetailExplainsWhichRowWasRejected() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1)
+                .willReturn(aResponse().withStatus(400).withHeader("Content-Type", "application/json")
+                        .withBody("{\"batchId\":null,\"errors\":[{\"index\":2,\"field\":\"interval\","
+                                + "\"message\":\"Interval '2x' is only valid on a fall-back day\"}]}")));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.failureReason()).isEqualTo(FailureReason.TARGET_REJECTED);
+        assertThat(task.failureDetail())
+                .contains("batch row 2 interval: Interval '2x' is only valid on a fall-back day");
+        wireMock.verify(1, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH))); // a 400 is never retried
+    }
+
+    @Test
+    void failure10_ledgerPoint401FailsTheWholeJobAndLeavesNoTaskUnfinished() {
+        stubSeriesList("SERIES_ALPHA_001", "SERIES_BETA_002", "SERIES_GAMMA_003");
+        for (String name : List.of("SERIES_ALPHA_001", "SERIES_BETA_002", "SERIES_GAMMA_003")) {
+            stubValues(name, valuesBody(name, 1440, value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        }
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1).willReturn(aResponse().withStatus(401)));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        assertThat(summary.status()).isEqualTo(JobStatus.FAILED);
+        // Every Task either got the 401 itself or stopped because a sibling did; none stays PENDING/RUNNING.
+        assertThat(tasksByName(summary).values()).hasSize(3).allMatch(t -> t.status() == TaskStatus.FAILED);
+    }
+
+    @Test
+    void failure_aRejectedBatchIsNotPersistedSoTheNextRunSendsItAgain() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        // First POST is rejected, every later one is accepted.
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1).inScenario("reject-once")
+                .whenScenarioStateIs(STARTED)
+                .willReturn(aResponse().withStatus(400).withHeader("Content-Type", "application/json")
+                        .withBody("{\"batchId\":null,\"errors\":[{\"index\":0,\"field\":\"value\",\"message\":\"no\"}]}"))
+                .willSetStateTo("accepting"));
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1).inScenario("reject-once")
+                .whenScenarioStateIs("accepting")
+                .willReturn(okJson(LEDGERPOINT_OK)));
+
+        JobSummary first = sync(NOV_1, NOV_1);
+
+        assertThat(tasksByName(first).get("SERIES_ALPHA_001").failureReason()).isEqualTo(FailureReason.TARGET_REJECTED);
+        assertThat(store.lastSyncedDate("SERIES_ALPHA_001")).isNull(); // watermark untouched
+        assertThat(store.chunkStatuses()).containsExactly(ChunkStatus.FAILED);
+
+        JobSummary second = sync(NOV_1, NOV_1);
+
+        JobTask resent = tasksByName(second).get("SERIES_ALPHA_001");
+        assertThat(resent.status()).isEqualTo(TaskStatus.SUCCESS);
+        assertThat(resent.valuesSent()).isEqualTo(1); // nothing was stored by the rejected run, so it is NEW again
+        assertThat(store.lastSyncedDate("SERIES_ALPHA_001")).isEqualTo(LocalDate.of(2026, 11, 1));
+
+        wireMock.resetRequests();
+        sync(NOV_1, NOV_1);
+        assertThat(postedRows()).isEmpty(); // now persisted, so a third run has nothing to send
+    }
+
+    @Test
+    void edge01_anEmptySeriesListIsValidAndCompletesTheJobWithNoTasks() {
+        stubSeriesList();
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(summary.taskCounts()).isEmpty();
+        wireMock.verify(0, getRequestedFor(urlPathMatching("/v1/series/.*/values")));
+    }
+
+    @Test
+    void edge01_seriesNameFilterSyncsOnlyThatSeries() {
+        stubSeriesList("SERIES_ALPHA_001", "SERIES_BETA_002", "SERIES_GAMMA_003");
+        for (String name : List.of("SERIES_ALPHA_001", "SERIES_BETA_002", "SERIES_GAMMA_003")) {
+            stubValues(name, valuesBody(name, 1440, value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        }
+
+        JobSummary summary = sync("SERIES_BETA_002", NOV_1, NOV_1);
+
+        assertThat(tasksByName(summary)).containsOnlyKeys("SERIES_BETA_002");
+        wireMock.verify(1, getRequestedFor(urlPathEqualTo("/v1/series/SERIES_BETA_002/values")));
+        wireMock.verify(0, getRequestedFor(urlPathEqualTo("/v1/series/SERIES_ALPHA_001/values")));
+        wireMock.verify(0, getRequestedFor(urlPathEqualTo("/v1/series/SERIES_GAMMA_003/values")));
+    }
+
+    @Test
+    void edge01_aSeriesNameThatOrionDoesNotListCompletesWithNoTasks() {
+        stubSeriesList("SERIES_ALPHA_001");
+
+        JobSummary summary = sync("DOES_NOT_EXIST", NOV_1, NOV_1);
+
+        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(summary.taskCounts()).isEmpty();
+    }
+
+    @Test
+    void edge01_aSecondTriggerWhileAJobIsRunningIsRejectedAndTheLockIsReleasedAfterwards() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        // A slow LedgerPoint keeps the first job RUNNING long enough to race it.
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1)
+                .willReturn(okJson(LEDGERPOINT_OK).withFixedDelay(800)));
+
+        JobSummary first = service.triggerSync(SeriesType.TYPE_A, null, NOV_1, NOV_1, UUID.randomUUID());
+        assertThatThrownBy(() -> service.triggerSync(SeriesType.TYPE_A, null, NOV_1, NOV_1, UUID.randomUUID()))
+                .isInstanceOf(JobAlreadyRunningException.class);
+
+        assertThat(awaitJob(first).status()).isEqualTo(JobStatus.COMPLETED);
+        assertThat(sync(NOV_1, NOV_1).status()).isEqualTo(JobStatus.COMPLETED); // lock released
+    }
+
+    @Test
+    void edge02_aWindowInsideOneMonthIsOneCallAndItsEndIsNormalizedToTheMonthEnd() {
+        stubSeriesList("SERIES_ALPHA_001");
+        String url = "/v1/series/SERIES_ALPHA_001/values";
+        // Only this exact window is stubbed, so a wrong start/end makes the Task fail instead of passing silently.
+        wireMock.stubFor(get(urlPathEqualTo(url))
+                .withQueryParam("start_prevailing", equalTo("11/1/2026 12:00:00 AM"))
+                .withQueryParam("end_prevailing", equalTo("11/30/2026 11:59:59 PM"))
+                .willReturn(okJson(valuesBody("SERIES_ALPHA_001", 1440,
+                        value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")))));
+
+        JobSummary summary = sync(NOV_1, Instant.parse("2026-11-10T00:00:00Z"));
+
+        assertThat(tasksByName(summary).get("SERIES_ALPHA_001").status())
+                .isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+        wireMock.verify(1, getRequestedFor(urlPathEqualTo(url)));
+    }
+
+    @Test
+    void edge02_aWindowCrossingNewYearUsesOneCallPerCalendarMonth() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", "12/15/2026 12:00:00 AM", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 12, 15, 0, 0), false, "1.0")));
+        stubValues("SERIES_ALPHA_001", "1/1/2027 12:00:00 AM", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2027, 1, 1, 0, 0), false, "2.0")));
+
+        JobSummary summary = sync(Instant.parse("2026-12-15T00:00:00Z"), Instant.parse("2027-01-10T00:00:00Z"));
+
+        assertThat(tasksByName(summary).get("SERIES_ALPHA_001").status())
+                .isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+        wireMock.verify(2, getRequestedFor(urlPathMatching("/v1/series/SERIES_ALPHA_001/values")));
+    }
+
+    @Test
+    void edge03_fifteenMinuteFallBackDayHasHundredRowsWithFourRepeatedQuarterHours() {
+        stubSeriesList("SERIES_ALPHA_001");
+        List<String> values = new ArrayList<>();
+        for (int quarter = 0; quarter < 96; quarter++) {
+            values.add(value(LocalDateTime.of(2026, 11, 1, quarter / 4, (quarter % 4) * 15), false,
+                    String.valueOf(quarter + 1)));
+        }
+        for (int minute = 0; minute < 60; minute += 15) {
+            values.add(value(LocalDateTime.of(2026, 11, 1, 1, minute), true, "900." + minute));
+        }
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 15, values.toArray(String[]::new)));
+
+        sync(NOV_1, NOV_1);
+
+        List<JsonNode> rows = postedRows();
+        assertThat(rows).hasSize(100); // 96 normal quarter-hours + the 4 repeated ones
+        assertThat(rows).filteredOn(r -> r.get("interval").asText().endsWith("x"))
+                .extracting(r -> r.get("interval").asText())
+                .containsExactlyInAnyOrder("5x", "6x", "7x", "8x");
+    }
+
+    @Test
+    void edge04_fifteenMinuteSpringForwardDayIsFilledToNinetySixRowsWithNoRepeatedSuffix() {
+        stubSeriesList("SERIES_ALPHA_001");
+        List<String> values = new ArrayList<>();
+        for (int quarter = 0; quarter < 96; quarter++) {
+            if (quarter / 4 == 2) {
+                continue; // 02:00-02:59 does not exist on 2026-03-08 in Central time
+            }
+            values.add(value(LocalDateTime.of(2026, 3, 8, quarter / 4, (quarter % 4) * 15), false,
+                    String.valueOf(quarter + 1)));
+        }
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 15, values.toArray(String[]::new)));
+
+        sync(Instant.parse("2026-03-08T00:00:00Z"), Instant.parse("2026-03-08T00:00:00Z"));
+
+        List<JsonNode> rows = postedRows();
+        assertThat(rows).hasSize(96);
+        assertThat(rows).noneMatch(r -> r.get("interval").asText().endsWith("x"));
+        for (String filled : List.of("9", "10", "11", "12")) {
+            assertThat(rowFor(rows, filled)).isEqualTo("8"); // each skipped quarter copies the last real one
+        }
+        assertThat(rowFor(rows, "13")).isEqualTo("13");
+    }
+
+    @Test
+    void edge_missingIntervalsAreReportedAsWarningsAndNeverInvented() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 60,
+                value(LocalDateTime.of(2026, 11, 2, 0, 0), false, "1"),
+                value(LocalDateTime.of(2026, 11, 2, 1, 0), false, "2")));
+
+        JobSummary summary = sync(Instant.parse("2026-11-02T00:00:00Z"), Instant.parse("2026-11-02T00:00:00Z"));
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.SUCCESS_WITH_WARNINGS);
+        assertThat(task.valuesSent()).isEqualTo(2);
+        assertThat(postedRows()).extracting(r -> r.get("interval").asText()).containsExactlyInAnyOrder("1", "2");
+        assertThat(store.warningCount()).isEqualTo(22); // intervals 3..24 of that day
+    }
+
+    @Test
+    void edge05_unsupportedGranularityFailsTheTaskAndPostsNothing() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 30,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "1")));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.UNSUPPORTED_GRANULARITY);
+        wireMock.verify(0, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+    }
+
+    @Test
+    void edge_unsupportedTimezoneFailsTheTaskBeforeAnyValuesCallAndSparesTheOthers() {
+        stubSeriesJson(
+                seriesJson("SERIES_ALPHA_001", 99, "10/12/2026 6:00:00 PM"),
+                seriesJson("SERIES_BETA_002", 6, "10/12/2026 6:00:00 PM"));
+        stubValues("SERIES_BETA_002", valuesBody("SERIES_BETA_002", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "40.00")));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        Map<String, JobTask> tasks = tasksByName(summary);
+        assertThat(tasks.get("SERIES_ALPHA_001").status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(tasks.get("SERIES_ALPHA_001").failureReason()).isEqualTo(FailureReason.UNSUPPORTED_TIMEZONE);
+        assertThat(tasks.get("SERIES_ALPHA_001").failureDetail()).contains("99");
+        assertThat(tasks.get("SERIES_BETA_002").status()).isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+        wireMock.verify(0, getRequestedFor(urlPathEqualTo("/v1/series/SERIES_ALPHA_001/values")));
+    }
+
+    @Test
+    void edge_noValuesInTheWindowFailsWithNoDataAndKeepsTheWatermark() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440)); // empty values array
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.NO_DATA);
+        assertThat(store.lastSyncedDate("SERIES_ALPHA_001")).isNull();
+        wireMock.verify(0, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+    }
+
+    @Test
+    void edge11_aSeriesExactlyAtTheStalenessLimitIsStillSynced() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        // lastUpdatedDate 10/12/2026 6:00 PM Central is 2026-10-12T23:00:00Z; exactly 5 days later is not "older than 5 days".
+        now.set(Instant.parse("2026-10-17T23:00:00Z"));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        assertThat(tasksByName(summary).get("SERIES_ALPHA_001").status())
+                .isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+    }
+
+    @Test
+    void edge11_aSeriesOneSecondPastTheStalenessLimitIsStale() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        now.set(Instant.parse("2026-10-17T23:00:01Z"));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.STALE_SERIES);
+        wireMock.verify(0, getRequestedFor(urlPathMatching("/v1/series/.*/values")));
+    }
+
+    @Test
+    void edge11_oneStaleSeriesDoesNotBlockTheFreshOnes() {
+        stubSeriesJson(
+                seriesJson("SERIES_ALPHA_001", 6, "10/1/2026 6:00:00 PM"),
+                seriesJson("SERIES_BETA_002", 6, "10/12/2026 6:00:00 PM"));
+        stubValues("SERIES_BETA_002", valuesBody("SERIES_BETA_002", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "40.00")));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        Map<String, JobTask> tasks = tasksByName(summary);
+        assertThat(tasks.get("SERIES_ALPHA_001").failureReason()).isEqualTo(FailureReason.STALE_SERIES);
+        assertThat(tasks.get("SERIES_BETA_002").status()).isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED_WITH_FAILURES);
+        wireMock.verify(0, getRequestedFor(urlPathEqualTo("/v1/series/SERIES_ALPHA_001/values")));
+    }
+
+    @Test
+    void edge_aSkipRuleSkipsTheSeriesWithoutContactingOrionOrLedgerPoint() {
+        store.addOverride(new SeriesRuleOverride("SERIES_BETA_002", null, true));
+        stubSeriesList("SERIES_ALPHA_001", "SERIES_BETA_002");
+        for (String name : List.of("SERIES_ALPHA_001", "SERIES_BETA_002")) {
+            stubValues(name, valuesBody(name, 1440, value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        }
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        Map<String, JobTask> tasks = tasksByName(summary);
+        assertThat(tasks.get("SERIES_BETA_002").status()).isEqualTo(TaskStatus.SKIPPED);
+        assertThat(tasks.get("SERIES_ALPHA_001").status()).isIn(TaskStatus.SUCCESS, TaskStatus.SUCCESS_WITH_WARNINGS);
+        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED); // a skipped series is not a failure
+        wireMock.verify(0, getRequestedFor(urlPathEqualTo("/v1/series/SERIES_BETA_002/values")));
+        assertThat(postedRows()).hasSize(1);
+    }
+
+    @Test
+    void edge_aKeyOverrideChangesTheKeyPostedToLedgerPoint() {
+        store.addOverride(new SeriesRuleOverride("SERIES_ALPHA_001", "LP_ALPHA_KEY", false));
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+
+        sync(NOV_1, NOV_1);
+
+        assertThat(postedRows()).hasSize(1).allSatisfy(r -> assertThat(r.get("key").asText()).isEqualTo("LP_ALPHA_KEY"));
+    }
+
+    @Test
+    void edge_aBatchAboveTheLimitIsSplitIntoSeveralRequests() {
+        ledgerPointProperties.setMaxBatchSize(2);
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "1"),
+                value(LocalDateTime.of(2026, 11, 2, 0, 0), false, "2"),
+                value(LocalDateTime.of(2026, 11, 3, 0, 0), false, "3"),
+                value(LocalDateTime.of(2026, 11, 4, 0, 0), false, "4"),
+                value(LocalDateTime.of(2026, 11, 5, 0, 0), false, "5")));
+
+        sync(NOV_1, NOV_1);
+
+        List<LoggedRequest> requests = wireMock.findAll(postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+        assertThat(requests).hasSize(3);
+        assertThat(requests).extracting(r -> rowsIn(r)).containsExactlyInAnyOrder(2, 2, 1);
+        assertThat(postedRows()).hasSize(5);
+    }
+
+    @Test
+    void edge12_negativeZeroAndVerySmallValuesArePostedAsPlainDecimals() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "-5.5"),
+                value(LocalDateTime.of(2026, 11, 2, 0, 0), false, "0"),
+                value(LocalDateTime.of(2026, 11, 3, 0, 0), false, "0.000125"),
+                value(LocalDateTime.of(2026, 11, 4, 0, 0), false, "1.25E-4")));
+
+        sync(NOV_1, NOV_1);
+
+        assertThat(postedRows()).extracting(r -> r.get("value").asText())
+                .containsExactlyInAnyOrder("-5.5", "0", "0.000125", "0.000125");
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private RestClient restClient(String baseUrl) {
@@ -471,7 +943,14 @@ class AcceptanceCriteriaTest {
 
     /** Triggers a sync and polls the job (as an API client would) until it leaves RUNNING. */
     private JobSummary sync(Instant start, Instant end) {
-        JobSummary started = service.triggerSync(SeriesType.TYPE_A, null, start, end, UUID.randomUUID());
+        return sync(null, start, end);
+    }
+
+    private JobSummary sync(String seriesName, Instant start, Instant end) {
+        return awaitJob(service.triggerSync(SeriesType.TYPE_A, seriesName, start, end, UUID.randomUUID()));
+    }
+
+    private JobSummary awaitJob(JobSummary started) {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         JobDetail detail = service.getJob(started.jobId());
         while (detail.status() == JobStatus.RUNNING) {
@@ -490,6 +969,26 @@ class AcceptanceCriteriaTest {
         detail.tasks().forEach(t -> counts.merge(t.status(), 1, Integer::sum));
         return new JobSummary(detail.jobId(), detail.seriesType(), detail.status(), started.startedAt(),
                 Instant.now(), counts, detail.correlationId());
+    }
+
+    /** Like {@code stubSeriesList} but lets a test choose each series' timezone code and lastUpdatedDate. */
+    private void stubSeriesJson(String... seriesObjects) {
+        wireMock.stubFor(get(urlPathEqualTo("/v1/series"))
+                .willReturn(okJson("{\"series\":[" + String.join(",", seriesObjects) + "]}")));
+    }
+
+    private static String seriesJson(String name, int timeZone, String lastUpdated) {
+        return "{\"seriesName\":\"" + name + "\",\"seriesType\":\"typeA\",\"timeZone\":" + timeZone
+                + ",\"lastUpdatedDate\":\"" + lastUpdated + "\","
+                + "\"earliestDataDate\":\"1/1/2020 12:00:00 AM\",\"latestDataDate\":\"11/30/2026 11:00:00 PM\"}";
+    }
+
+    private int rowsIn(LoggedRequest request) {
+        try {
+            return json.readTree(request.getBodyAsString()).size();
+        } catch (IOException e) {
+            throw new IllegalStateException("LedgerPoint request body was not JSON", e);
+        }
     }
 
     private Map<String, JobTask> tasksByName(JobSummary summary) {
@@ -566,9 +1065,23 @@ class AcceptanceCriteriaTest {
         private final Map<String, SeriesDescriptor> series = new HashMap<>();
         private final Map<Long, Map<SeriesValueKey, NormalizedSeriesValue>> values = new HashMap<>();
         private final Map<Long, ChunkStatus> chunks = new HashMap<>();
+        private final Map<String, SeriesRuleOverride> overrides = new HashMap<>();
+        private final List<String> warnings = new ArrayList<>();
 
         private synchronized long id() {
             return nextId++;
+        }
+
+        synchronized void addOverride(SeriesRuleOverride override) {
+            overrides.put(override.orionSeriesName(), override);
+        }
+
+        synchronized int warningCount() {
+            return warnings.size();
+        }
+
+        synchronized LocalDate lastSyncedDate(String seriesName) {
+            return series.get(seriesName).lastSyncedDate();
         }
 
         synchronized void reset() {
@@ -607,8 +1120,8 @@ class AcceptanceCriteriaTest {
         }
 
         @Override
-        public int failStaleRunningJobs(Instant startedBefore) {
-            return 0;
+        public List<Long> failStaleRunningJobs(Instant startedBefore) {
+            return List.of();
         }
 
         @Override
@@ -644,6 +1157,20 @@ class AcceptanceCriteriaTest {
                     valuesSent, t.startedAt() != null ? t.startedAt() : NOW, NOW));
         }
 
+        @Override
+        public synchronized int failUnfinishedTasks(Long jobId, FailureReason reason, String detail) {
+            int changed = 0;
+            for (JobTask t : new ArrayList<>(tasks.values())) {
+                if (t.jobId().equals(jobId)
+                        && (t.status() == TaskStatus.PENDING || t.status() == TaskStatus.RUNNING)) {
+                    tasks.put(t.id(), new JobTask(t.id(), t.jobId(), t.seriesId(), t.seriesName(), TaskStatus.FAILED,
+                            reason, detail, 0, t.startedAt(), NOW));
+                    changed++;
+                }
+            }
+            return changed;
+        }
+
         // SeriesRepositoryPort
         @Override
         public synchronized List<SeriesDescriptor> upsertAll(List<SeriesDescriptor> descriptors) {
@@ -653,7 +1180,7 @@ class AcceptanceCriteriaTest {
                 SeriesDescriptor stored = new SeriesDescriptor(
                         existing != null ? existing.id() : id(), d.name(), d.type(), d.timeZone(),
                         d.lastUpdatedDate(), d.earliestDataDate(), d.latestDataDate(),
-                        existing != null ? existing.lastSyncedDate() : null);
+                        existing != null ? existing.lastSyncedDate() : null, d.orionTimeZoneCode());
                 series.put(d.name(), stored);
                 result.add(stored);
             }
@@ -669,7 +1196,7 @@ class AcceptanceCriteriaTest {
         public synchronized void updateLastSyncedDate(Long seriesId, LocalDate lastSyncedDate) {
             series.replaceAll((name, s) -> s.id().equals(seriesId)
                     ? new SeriesDescriptor(s.id(), s.name(), s.type(), s.timeZone(), s.lastUpdatedDate(),
-                            s.earliestDataDate(), s.latestDataDate(), lastSyncedDate)
+                            s.earliestDataDate(), s.latestDataDate(), lastSyncedDate, s.orionTimeZoneCode())
                     : s);
         }
 
@@ -724,15 +1251,15 @@ class AcceptanceCriteriaTest {
         }
 
         @Override
-        public void recordWarning(Long chunkId, WarningType type, LocalDate intervalDate, String intervalNumber,
-                                  String detail) {
-            // warnings are not asserted by the acceptance suite
+        public synchronized void recordWarning(Long chunkId, WarningType type, LocalDate intervalDate,
+                                               String intervalNumber, String detail) {
+            warnings.add(type + ":" + intervalDate + ":" + intervalNumber);
         }
 
         // RuleOverrideRepositoryPort
         @Override
-        public Optional<SeriesRuleOverride> findActiveByOrionSeriesName(String orionSeriesName) {
-            return Optional.empty();
+        public synchronized Optional<SeriesRuleOverride> findActiveByOrionSeriesName(String orionSeriesName) {
+            return Optional.ofNullable(overrides.get(orionSeriesName));
         }
     }
 }

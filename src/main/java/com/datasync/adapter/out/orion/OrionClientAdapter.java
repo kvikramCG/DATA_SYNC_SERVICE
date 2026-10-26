@@ -85,7 +85,7 @@ public class OrionClientAdapter implements SeriesSourcePort {
             return callAndMap(type, token);
         } catch (OrionAuthException authException) {
             log.warn("Orion rejected the cached token, refreshing and retrying once: {}", authException.getMessage());
-            tokenCache.invalidate();
+            tokenCache.invalidate(token);
             String refreshedToken = tokenCache.getToken();
             return callAndMap(type, refreshedToken);
         }
@@ -149,7 +149,7 @@ public class OrionClientAdapter implements SeriesSourcePort {
             return callAndMapValues(seriesName, start, end, token, httpCalls);
         } catch (OrionAuthException authException) {
             log.warn("Orion rejected the cached token, refreshing and retrying once: {}", authException.getMessage());
-            tokenCache.invalidate();
+            tokenCache.invalidate(token);
             String refreshedToken = tokenCache.getToken();
             return callAndMapValues(seriesName, start, end, refreshedToken, httpCalls);
         }

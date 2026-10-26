@@ -19,11 +19,13 @@ import com.datasync.domain.port.out.JobRepositoryPort;
 import com.datasync.domain.port.out.SyncMetricsPort;
 import com.datasync.domain.port.out.TaskRepositoryPort;
 import com.datasync.domain.service.MonthChunker;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
@@ -33,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -62,6 +65,8 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
     private static final String CORRELATION_ID_MDC_KEY = "correlationId";
     private static final String JOB_ID_MDC_KEY = "jobId";
     private static final String SERIES_NAME_MDC_KEY = "seriesName";
+    // Kept under the 30s ECS stop timeout; running jobs are told to stop and given this long to close.
+    private static final Duration SHUTDOWN_GRACE = Duration.ofSeconds(20);
 
     private final RefreshSeriesCatalogUseCase refreshSeriesCatalogUseCase;
     private final JobRepositoryPort jobRepositoryPort;
@@ -70,6 +75,7 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
     private final ExecutorService virtualThreadExecutor;
     private final ClockPort clock;
     private final SyncMetricsPort metrics;
+    private final JobAbortRegistry abortRegistry;
 
     public SyncOrchestrationService(RefreshSeriesCatalogUseCase refreshSeriesCatalogUseCase,
                                      JobRepositoryPort jobRepositoryPort,
@@ -77,7 +83,8 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
                                      SeriesSyncWorker seriesSyncWorker,
                                      ExecutorService virtualThreadExecutor,
                                      ClockPort clock,
-                                     SyncMetricsPort metrics) {
+                                     SyncMetricsPort metrics,
+                                     JobAbortRegistry abortRegistry) {
         this.refreshSeriesCatalogUseCase = refreshSeriesCatalogUseCase;
         this.jobRepositoryPort = jobRepositoryPort;
         this.taskRepositoryPort = taskRepositoryPort;
@@ -85,6 +92,21 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
         this.virtualThreadExecutor = virtualThreadExecutor;
         this.clock = clock;
         this.metrics = metrics;
+        this.abortRegistry = abortRegistry;
+    }
+
+    /**
+     * Tells every job running here to stop and waits briefly for them to close. Without this a deploy or
+     * restart leaves the job RUNNING, and the unique partial index then rejects every new sync of that
+     * series type until the reaper fires. Lives on this bean (not the registry) so it runs before the
+     * repositories and the connection pool, which the closing jobs still need, are destroyed.
+     */
+    @PreDestroy
+    void shutdown() {
+        abortRegistry.abortAll();
+        if (!abortRegistry.awaitIdle(SHUTDOWN_GRACE)) {
+            log.warn("Some jobs were still running after {}; the stale-job reaper will close them", SHUTDOWN_GRACE);
+        }
     }
 
     @Override
@@ -116,20 +138,23 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
                                      Instant endDate, UUID correlationId) {
         MDC.put(CORRELATION_ID_MDC_KEY, correlationId.toString());
         MDC.put(JOB_ID_MDC_KEY, String.valueOf(job.id()));
+        // Registered before any work so the reaper or shutdown can reach the job's workers from the start.
+        AtomicBoolean jobAborted = abortRegistry.register(job.id());
         try {
-            runJob(job, type, seriesName, startDate, endDate, correlationId);
+            runJob(job, type, seriesName, startDate, endDate, correlationId, jobAborted);
         } catch (RuntimeException ex) {
             // Nobody is waiting on this thread, so the failure is recorded on the Job row (and in
             // the log) rather than propagated.
             failJobQuietly(job.id(), type, ex);
         } finally {
+            abortRegistry.unregister(job.id());
             MDC.remove(CORRELATION_ID_MDC_KEY);
             MDC.remove(JOB_ID_MDC_KEY);
         }
     }
 
     private void runJob(Job job, SeriesType type, String seriesName, Instant startDate, Instant endDate,
-                         UUID correlationId) {
+                         UUID correlationId, AtomicBoolean jobAborted) {
         List<SeriesDescriptor> persisted = refreshSeriesCatalogUseCase.refreshCatalog(type);
         List<SeriesDescriptor> targets = seriesName == null
                 ? persisted
@@ -151,15 +176,33 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
                 .map(d -> taskRepositoryPort.createTask(job.id(), d.id(), d.name()))
                 .toList();
 
-        boolean jobShouldFail = runTasksConcurrently(job.id(), targets, tasks, startDate, endDate, correlationId);
+        boolean jobShouldFail = runTasksConcurrently(job.id(), targets, tasks, startDate, endDate, correlationId,
+                jobAborted);
+
+        // Item 1: any Task still PENDING/RUNNING here never reported back (e.g. its own status write failed).
+        // Failing it now keeps it from sitting "waiting" forever and makes the job counts below honest.
+        failUnfinishedTasks(job.id(), "Task did not finish before the job ended");
 
         List<JobTask> finalTasks = taskRepositoryPort.findByJobId(job.id());
         finalTasks.forEach(t -> metrics.taskFinished(t.status(), t.failureReason()));
         Map<TaskStatus, Integer> taskCounts = countByStatus(finalTasks);
         // Lifecycle log: per-status task totals, so a job's outcome is visible without querying the DB.
         log.info("Sync job {} tasks finished: {}", job.id(), taskCounts);
-        JobStatus finalStatus = determineFinalStatus(jobShouldFail, taskCounts);
+        // An abort raised from outside (reaper, shutdown) must also end the job FAILED, not "with failures".
+        JobStatus finalStatus = determineFinalStatus(jobShouldFail || jobAborted.get(), taskCounts);
         finishJob(job.id(), type, finalStatus);
+    }
+
+    private void failUnfinishedTasks(Long jobId, String detail) {
+        try {
+            int failed = taskRepositoryPort.failUnfinishedTasks(jobId, FailureReason.INTERNAL_ERROR, detail);
+            if (failed > 0) {
+                log.warn("Sync job {}: failed {} task(s) that never reached a final status", jobId, failed);
+            }
+        } catch (RuntimeException ex) {
+            // Cleanup must not hide the failure that got us here or stop the job from being closed.
+            log.error("Could not fail the unfinished tasks of job {}", jobId, ex);
+        }
     }
 
     private void finishJob(Long jobId, SeriesType type, JobStatus status) {
@@ -182,6 +225,8 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
 
     private void failJobQuietly(Long jobId, SeriesType type, RuntimeException cause) {
         log.error("Sync job {} failed unexpectedly, marking it FAILED", jobId, cause);
+        // Item 1: Tasks created before the failure would otherwise stay PENDING on a job that is already over.
+        failUnfinishedTasks(jobId, "Job failed before this task finished: " + cause.getClass().getSimpleName());
         try {
             finishJob(jobId, type, JobStatus.FAILED);
         } catch (RuntimeException markFailure) {
@@ -195,9 +240,9 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
      *         (a LedgerPoint auth failure - spec &sect;8).
      */
     private boolean runTasksConcurrently(Long jobId, List<SeriesDescriptor> targets, List<JobTask> tasks,
-                                          Instant startDate, Instant endDate, UUID correlationId) {
+                                          Instant startDate, Instant endDate, UUID correlationId,
+                                          AtomicBoolean jobAborted) {
         List<Callable<TaskOutcome>> jobsToRun = new ArrayList<>(targets.size());
-        AtomicBoolean jobAborted = new AtomicBoolean(false);
         for (int i = 0; i < targets.size(); i++) {
             SeriesDescriptor series = targets.get(i);
             Long taskId = tasks.get(i).id();
@@ -231,6 +276,10 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
                     // defensive fallback (e.g. an Error) so the Task is never left PENDING.
                     log.error("Unexpected failure processing a series task", e.getCause());
                     markTaskInternalError(tasks.get(i).id(), e.getCause());
+                } catch (CancellationException e) {
+                    // Unchecked, so it would otherwise escape and abort the loop, leaving the remaining Tasks uncollected.
+                    log.error("A series task was cancelled before it finished", e);
+                    markTaskInternalError(tasks.get(i).id(), e);
                 }
             }
         } catch (InterruptedException e) {
@@ -243,7 +292,7 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
     private void markTaskInternalError(Long taskId, Throwable cause) {
         try {
             taskRepositoryPort.updateTaskStatus(taskId, TaskStatus.FAILED, FailureReason.INTERNAL_ERROR,
-                    cause.getClass().getSimpleName() + ": " + cause.getMessage(), 0);
+                    cause.getClass().getSimpleName() + (cause.getMessage() == null ? "" : ": " + cause.getMessage()), 0);
         } catch (RuntimeException ex) {
             log.error("Could not mark task {} FAILED after an unexpected error", taskId, ex);
         }

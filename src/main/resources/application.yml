@@ -1,7 +1,12 @@
 server:
   port: 8080
+  # Item 8: on SIGTERM stop accepting new requests but let in-flight ones finish, instead of cutting them off.
+  shutdown: graceful
 
 spring:
+  lifecycle:
+    # Upper bound for that drain; keep it below the platform's stop timeout (ECS default 30s).
+    timeout-per-shutdown-phase: 25s
   application:
     name: data-sync-service
   threads:
@@ -103,6 +108,9 @@ resilience4j:
       orion:
         max-attempts: 3
         wait-duration: 300ms
+        # Item 6: Resilience4j ignores exponential-backoff-multiplier unless this flag is true,
+        # which would silently turn the backoff into a fixed 300ms.
+        enable-exponential-backoff: true
         exponential-backoff-multiplier: 2
         retry-exceptions:
           - com.datasync.domain.exception.OrionTransientException
@@ -112,6 +120,8 @@ resilience4j:
       ledgerpoint:
         max-attempts: 3
         wait-duration: 300ms
+        # Item 6: see the orion instance above; same reason.
+        enable-exponential-backoff: true
         exponential-backoff-multiplier: 2
         retry-exceptions:
           - com.datasync.domain.exception.LedgerPointTransientException
