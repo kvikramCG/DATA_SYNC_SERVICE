@@ -62,16 +62,25 @@ public class SeriesRepositoryAdapter implements SeriesRepositoryPort {
                         now));
 
         entity.setTimeZoneCode(descriptor.orionTimeZoneCode());
-        entity.setEarliestDataDate(descriptor.earliestDataDate() == null
-                ? null : descriptor.earliestDataDate().toLocalDate());
-        entity.setLatestDataDate(descriptor.latestDataDate() == null
-                ? null : descriptor.latestDataDate().toLocalDate());
+        // A date Orion sent badly (catalogIssue set) must not erase the last good stored value.
+        boolean keepStoredWhenMissing = descriptor.catalogIssue() != null;
+        if (descriptor.earliestDataDate() != null || !keepStoredWhenMissing) {
+            entity.setEarliestDataDate(descriptor.earliestDataDate() == null
+                    ? null : descriptor.earliestDataDate().toLocalDate());
+        }
+        if (descriptor.latestDataDate() != null || !keepStoredWhenMissing) {
+            entity.setLatestDataDate(descriptor.latestDataDate() == null
+                    ? null : descriptor.latestDataDate().toLocalDate());
+        }
         // Without a supported timezone the local timestamp cannot be turned into an instant.
-        entity.setLastUpdatedDate(descriptor.lastUpdatedDate() == null || descriptor.timeZone() == null
-                ? null : descriptor.lastUpdatedDate().atZone(ZoneId.of(descriptor.timeZone().ianaZoneId())).toInstant());
+        if (descriptor.lastUpdatedDate() != null || !keepStoredWhenMissing) {
+            entity.setLastUpdatedDate(descriptor.lastUpdatedDate() == null || descriptor.timeZone() == null
+                    ? null : descriptor.lastUpdatedDate().atZone(ZoneId.of(descriptor.timeZone().ianaZoneId())).toInstant());
+        }
         entity.setUpdatedAt(now);
 
-        return toDomain(repository.save(entity));
+        // The issue is carried for this run only (not stored), so the worker can fail that series' Task.
+        return toDomain(repository.save(entity)).withCatalogIssue(descriptor.catalogIssue());
     }
 
     @Override

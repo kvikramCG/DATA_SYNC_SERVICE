@@ -18,9 +18,13 @@ public final class UnitMapper {
     }
 
     /**
-     * Unknown Orion unit codes pass through unchanged (spec &sect;6.5 "anything else").
+     * Unknown Orion unit codes pass through unchanged (spec &sect;6.5 "anything else"). A missing unit
+     * stays missing: it must never fail the Task, because the unit only feeds the log/audit label.
      */
     public static String map(String orionUnit) {
+        if (orionUnit == null) {
+            return null;
+        }
         return MAPPING.getOrDefault(orionUnit, orionUnit);
     }
 }

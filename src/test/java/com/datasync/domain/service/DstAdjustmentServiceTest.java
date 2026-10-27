@@ -33,6 +33,29 @@ class DstAdjustmentServiceTest {
         assertThat(result).extracting(NormalizedSeriesValue::value)
                 .containsExactly(new BigDecimal("22.10"), new BigDecimal("22.10"), new BigDecimal("23.40"));
         assertThat(result).extracting(NormalizedSeriesValue::repeatedHour).containsOnly(false);
+        // Only the derived row is a filler, and it records which real interval it was copied from.
+        assertThat(result).extracting(NormalizedSeriesValue::filler).containsExactly(false, true, false);
+        assertThat(result.get(1).copiedFromInterval()).isEqualTo("2");
+    }
+
+    @Test
+    void everyFillerOfAFifteenMinuteSpringForwardGapPointsAtTheLastRealInterval() {
+        List<RawSeriesValue> raw = List.of(
+                new RawSeriesValue(LocalDateTime.of(2026, 3, 8, 1, 45), false, new BigDecimal("8")),
+                new RawSeriesValue(LocalDateTime.of(2026, 3, 8, 3, 0), false, new BigDecimal("13")));
+
+        List<NormalizedSeriesValue> result = DstAdjustmentService.normalize(raw, CHICAGO, 15);
+
+        // intervals 8 (real), 9-12 (skipped 02:00-02:59), 13 (real); the list is ordered by instant, so
+        // fillers interleave with the real rows that share their instants.
+        assertThat(result).extracting(NormalizedSeriesValue::intervalNumber)
+                .containsExactlyInAnyOrder("8", "9", "10", "11", "12", "13");
+        assertThat(result.stream().filter(NormalizedSeriesValue::filler))
+                .hasSize(4)
+                .allSatisfy(filler -> {
+                    assertThat(filler.copiedFromInterval()).isEqualTo("8");
+                    assertThat(filler.value()).isEqualByComparingTo("8");
+                });
     }
 
     @Test

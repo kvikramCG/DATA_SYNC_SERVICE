@@ -4,6 +4,8 @@ import jakarta.validation.constraints.NotBlank;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
+import java.time.Duration;
+
 /**
  * Configuration for the LedgerPoint outbound adapter (spec &sect;5).
  */
@@ -19,6 +21,8 @@ public class LedgerPointProperties {
     private long connectTimeoutMs = 5000;
     private long readTimeoutMs = 60000;
     private int maxBatchSize = 10_000;
+    // Upper bound for honoring a LedgerPoint 429 Retry-After header before the next retry attempt.
+    private Duration maxRetryAfter = Duration.ofSeconds(60);
 
     public String getBaseUrl() {
         return baseUrl;
@@ -58,5 +62,13 @@ public class LedgerPointProperties {
 
     public void setMaxBatchSize(int maxBatchSize) {
         this.maxBatchSize = maxBatchSize;
+    }
+
+    public Duration getMaxRetryAfter() {
+        return maxRetryAfter;
+    }
+
+    public void setMaxRetryAfter(Duration maxRetryAfter) {
+        this.maxRetryAfter = maxRetryAfter;
     }
 }

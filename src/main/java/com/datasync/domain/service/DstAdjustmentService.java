@@ -31,6 +31,10 @@ import java.util.stream.Collectors;
  * service detects the gap via {@link java.time.zone.ZoneRules#getTransition} and fills it by
  * copying the immediately preceding interval's value (spec &sect;6.4), never emitting an
  * {@code x} suffix for it.
+ *
+ * <p>DECISION ("option B"): those copied rows are flagged {@code filler} (see {@link NormalizedSeriesValue})
+ * and are never stored in {@code series_value}, because their instant equals the next real interval's
+ * primary key. They are re-derived on every run; {@code ChangeDetector} decides whether to send them.
  */
 public final class DstAdjustmentService {
 
@@ -97,8 +101,12 @@ public final class DstAdjustmentService {
             }
             if (previous != null) {
                 Instant instant = candidate.atZone(zoneId).toInstant();
+                // With several skipped intervals (15-minute data) the previous one may itself be a filler;
+                // trace back to the real interval so all of them depend on the same source.
+                String source = previous.filler() ? previous.copiedFromInterval() : previous.intervalNumber();
                 baseByInterval.put(missingInterval,
-                        new NormalizedSeriesValue(date, String.valueOf(missingInterval), instant, false, previous.value()));
+                        new NormalizedSeriesValue(date, String.valueOf(missingInterval), instant, false,
+                                previous.value(), true, source));
             }
             // If there is no preceding interval at all (gap at the very start of the day), it is
             // left unfilled - a later slice's gap-warning logic (spec &sect;6.8) handles that.

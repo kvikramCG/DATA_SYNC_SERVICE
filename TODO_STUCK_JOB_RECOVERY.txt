@@ -1,6 +1,10 @@
 TODO: STOP A CRASHED JOB FROM BLOCKING ITS SERIES TYPE
 ======================================================
 
+STATUS (decision): DEFERRED. Only the fixed timeout was changed: max-running-duration is now PT6H
+(was PT2H) so a healthy first run is not reaped. The heartbeat design below was NOT built, so a
+crash can now block the series type for up to about 6 hours 5 minutes. Revisit if that is too long.
+
 PROBLEM
 -------
 If the process crashes while a job is running, its row stays RUNNING. The unique
@@ -8,8 +12,8 @@ partial index uq_job_running_per_type (V1__init_schema.sql) then allows no new j
 of that series type, so every POST /api/series/{type}/sync returns 409.
 
 StaleJobReaper only closes a job when started_at is older than
-datasync.job.max-running-duration (default PT2H), checked every 5 minutes. So a
-crash can block the series type for up to about 2 hours 5 minutes.
+datasync.job.max-running-duration (PT6H now, was PT2H), checked every 5 minutes. So a
+crash can block the series type for up to about 6 hours 5 minutes (was about 2 hours 5 minutes).
 
 The same rule can also kill a healthy job that legitimately runs longer than 2 hours.
 

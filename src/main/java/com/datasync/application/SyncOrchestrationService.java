@@ -19,6 +19,7 @@ import com.datasync.domain.port.out.JobRepositoryPort;
 import com.datasync.domain.port.out.SyncMetricsPort;
 import com.datasync.domain.port.out.TaskRepositoryPort;
 import com.datasync.domain.service.MonthChunker;
+import com.datasync.domain.service.SyncWindowRules;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -65,6 +66,8 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
     private static final String CORRELATION_ID_MDC_KEY = "correlationId";
     private static final String JOB_ID_MDC_KEY = "jobId";
     private static final String SERIES_NAME_MDC_KEY = "seriesName";
+    // Size of job.requested_series_name / series.name (VARCHAR(100)).
+    private static final int MAX_SERIES_NAME_LENGTH = 100;
     // Kept under the 30s ECS stop timeout; running jobs are told to stop and given this long to close.
     private static final Duration SHUTDOWN_GRACE = Duration.ofSeconds(20);
 
@@ -116,6 +119,12 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
             // Rejected before any Job row exists (mapped to HTTP 400 by the web adapter).
             throw new IllegalArgumentException("startDate must not be after endDate");
         }
+        if (seriesName != null && seriesName.length() > MAX_SERIES_NAME_LENGTH) {
+            // job.requested_series_name is VARCHAR(100). Without this the insert fails on length and the
+            // adapter would report it as "a job is already running" (409); spec §7.1: invalid input is a 400.
+            throw new IllegalArgumentException("seriesName must not be longer than " + MAX_SERIES_NAME_LENGTH
+                    + " characters");
+        }
 
         // Must stay OUTSIDE the try block: a JobAlreadyRunningException means another job owns the
         // RUNNING row, which must not be touched.
@@ -162,15 +171,24 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
 
         if (targets.isEmpty()) {
             // Nothing to process (unknown seriesName filter, or Orion returned no series for this
-            // type - spec &sect;4.2 notes an empty list is valid) - the job can legitimately close
-            // immediately rather than sit RUNNING forever.
+            // type - spec §4.2 notes an empty list is valid) - the job can legitimately close
+            // immediately rather than sit RUNNING forever. The caller already got its 202, so the
+            // log is where a mistyped seriesName becomes visible.
+            if (seriesName != null) {
+                log.warn("Sync job {} has nothing to do: no series named '{}' for type {} (it is not listed by Orion"
+                                + " or could not be saved to the catalog); closing it COMPLETED with no tasks",
+                        job.id(), LogText.clean(seriesName), type.wireValue());
+            } else {
+                log.warn("Sync job {} has nothing to do: Orion returned no series for type {}; closing it COMPLETED"
+                        + " with no tasks", job.id(), type.wireValue());
+            }
             finishJob(job.id(), type, JobStatus.COMPLETED);
             return;
         }
 
         // Lifecycle log: start of the job (cid/job are added by the log pattern from MDC).
         log.info("Sync job {} started: type={}, seriesFilter={}, targetSeries={}",
-                job.id(), type.wireValue(), seriesName, targets.size());
+                job.id(), type.wireValue(), LogText.clean(seriesName), targets.size());
 
         List<JobTask> tasks = targets.stream()
                 .map(d -> taskRepositoryPort.createTask(job.id(), d.id(), d.name()))
@@ -308,7 +326,7 @@ public class SyncOrchestrationService implements TriggerSyncUseCase, GetJobUseCa
                 ? callerStart.atZone(ZoneOffset.UTC).toLocalDate()
                 : series.lastSyncedDate() != null
                         ? series.lastSyncedDate()
-                        : clock.now().atZone(ZoneOffset.UTC).toLocalDate().minusYears(1);
+                        : SyncWindowRules.defaultStart(clock.now());
 
         LocalDate end = callerEnd != null
                 ? callerEnd.atZone(ZoneOffset.UTC).toLocalDate()

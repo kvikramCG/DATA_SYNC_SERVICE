@@ -1,6 +1,7 @@
 package com.datasync.adapter.out.orion;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
+import com.datasync.domain.exception.OrionDataException;
 import com.datasync.domain.exception.OrionTransientException;
 import com.datasync.domain.model.SeriesDescriptor;
 import com.datasync.domain.model.SeriesType;
@@ -25,6 +26,7 @@ import java.util.List;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -34,6 +36,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathMatching;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Plain unit test (no Spring context) - proves the Orion adapter's auth/retry/mapping behavior
@@ -252,6 +255,86 @@ class OrionClientAdapterTest {
         assertThat(result.get(0).orionTimeZoneCode()).isEqualTo(99);
         assertThat(result.get(1).name()).isEqualTo("SERIES_ALPHA_001");
         assertThat(result.get(1).timeZone()).isEqualTo(TimeZoneCode.CENTRAL);
+    }
+
+    @Test
+    void aMissingOrUnreadableCatalogDateKeepsTheSeriesAndRecordsAnIssue() {
+        String json = """
+                {"series":[
+                  {"seriesName":"SERIES_NO_DATE","seriesType":"typeA","timeZone":6,
+                   "earliestDataDate":"1/1/2020 12:00:00 AM","latestDataDate":"10/13/2026 11:00:00 PM"},
+                  {"seriesName":"SERIES_BAD_DATE","seriesType":"typeA","timeZone":6,
+                   "lastUpdatedDate":"not a date","earliestDataDate":"1/1/2020 12:00:00 AM",
+                   "latestDataDate":"10/13/2026 11:00:00 PM"},
+                  {"seriesName":"SERIES_ALPHA_001","seriesType":"typeA","timeZone":6,
+                   "lastUpdatedDate":"10/12/2026 6:00:00 PM","earliestDataDate":"1/1/2020 12:00:00 AM",
+                   "latestDataDate":"10/13/2026 11:00:00 PM"}
+                ]}
+                """;
+        wireMockServer.stubFor(post(urlEqualTo("/auth/token")).willReturn(okJson(TOKEN_JSON)));
+        wireMockServer.stubFor(get(urlPathEqualTo("/v1/series")).willReturn(okJson(json)));
+
+        List<SeriesDescriptor> result = adapter.listSeries(SeriesType.TYPE_A);
+
+        assertThat(result).hasSize(3);
+        assertThat(result.get(0).catalogIssue()).contains("lastUpdatedDate is missing");
+        assertThat(result.get(1).catalogIssue()).contains("lastUpdatedDate 'not a date' is not a valid Orion date");
+        assertThat(result.get(2).catalogIssue()).isNull();
+    }
+
+    @Test
+    void aValueWithNoReadingIsDroppedSoItBecomesAGapNotAFailure() {
+        stubValues("""
+                {"seriesName":"SERIES_ALPHA_001","unit":"UNIT_A","granularity":60,"timeZone":6,
+                "asOfDate":"10/12/2026 6:00:00 PM",
+                "values":[
+                  {"startDate":"11/2/2026 12:00:00 AM","repeatedHour":false,"value":1.5},
+                  {"startDate":"11/2/2026 1:00:00 AM","repeatedHour":false,"value":null}
+                ]}
+                """);
+
+        SeriesValuesResult result = fetchNovember();
+
+        assertThat(result.values()).hasSize(1);
+        assertThat(result.values().get(0).value()).isEqualByComparingTo("1.5");
+    }
+
+    @Test
+    void anUnreadableValueStartDateFailsWithADataExceptionAndIsNotRetried() {
+        stubValues("""
+                {"seriesName":"SERIES_ALPHA_001","unit":"UNIT_A","granularity":60,"timeZone":6,
+                "asOfDate":"10/12/2026 6:00:00 PM",
+                "values":[{"startDate":"garbage","repeatedHour":false,"value":1.5}]}
+                """);
+
+        assertThatThrownBy(this::fetchNovember)
+                .isInstanceOf(OrionDataException.class)
+                .hasMessageContaining("unreadable startDate 'garbage'");
+        wireMockServer.verify(1, getRequestedFor(urlPathMatching("/v1/series/SERIES_ALPHA_001/values")));
+    }
+
+    @Test
+    void aMissingOrBadAsOfDateAndAMissingUnitDoNotFailTheFetch() {
+        stubValues("""
+                {"seriesName":"SERIES_ALPHA_001","granularity":60,"timeZone":6,"asOfDate":"???",
+                "values":[{"startDate":"11/2/2026 12:00:00 AM","repeatedHour":false,"value":1.5}]}
+                """);
+
+        SeriesValuesResult result = fetchNovember();
+
+        assertThat(result.unit()).isNull();
+        assertThat(result.asOfDate()).isNull();
+        assertThat(result.values()).hasSize(1);
+    }
+
+    private void stubValues(String body) {
+        wireMockServer.stubFor(post(urlEqualTo("/auth/token")).willReturn(okJson(TOKEN_JSON)));
+        wireMockServer.stubFor(get(urlPathMatching("/v1/series/SERIES_ALPHA_001/values")).willReturn(okJson(body)));
+    }
+
+    private SeriesValuesResult fetchNovember() {
+        return adapter.fetchValues("SERIES_ALPHA_001",
+                LocalDateTime.of(2026, 11, 1, 0, 0, 0), LocalDateTime.of(2026, 11, 30, 23, 59, 59));
     }
 
     @Test

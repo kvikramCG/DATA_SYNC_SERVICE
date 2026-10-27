@@ -80,6 +80,8 @@ ledgerpoint:
   connect-timeout-ms: 5000
   read-timeout-ms: 60000
   max-batch-size: 10000
+  # Upper bound for honoring a LedgerPoint 429 Retry-After header before the next retry attempt.
+  max-retry-after: 60s
 
 datasync:
   sync:
@@ -87,8 +89,14 @@ datasync:
     stale-after-days: 5
   job:
     # A job still RUNNING after this long is assumed orphaned (e.g. crash) and is closed as FAILED
-    # so it stops blocking its series type. Keep it well above the longest legitimate job.
-    max-running-duration: PT2H
+    # so it stops blocking its series type. It is the ONLY crash-recovery path (no heartbeat), so after a
+    # crash that series type answers 409 for up to this long (+ reaper-interval); a healthy job that runs
+    # longer than this is also closed and its workers stopped.
+    # SIZING: Orion allows 5 requests/s, so a run takes about  series x chunks / 5  seconds, e.g. a
+    # first run (~13 monthly chunks) of 1,000 series ~ 43 min, 3,000 series ~ 2 h 10 min. Rule of thumb:
+    #   2 x (series x chunks / 5 s) + 30 min.   Later runs (~2 chunks) are a fraction of that.
+    # PT6H covers a first run of ~3,000 series with ~2.5x margin. Raise it for a larger catalog.
+    max-running-duration: PT6H
     reaper-interval: PT5M
     reaper-initial-delay: PT1M
 

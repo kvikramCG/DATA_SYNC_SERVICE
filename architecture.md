@@ -792,6 +792,12 @@ Example:
 copy prior interval value
 ```
 
+DECISION (option B): the copied ("filler") row is derived on every run and is never stored in
+`series_value` - its `start_instant` equals the next real interval's, which is its primary key.
+`ChangeDetector` gives a filler the classification of the interval it copies, so it is sent to
+LedgerPoint only when that interval is new or updated (a re-run of the day sends nothing). Fillers
+count in `valuesSent` but not in the fetched/new/updated/unchanged chunk counts.
+
 ---
 
 ## Fall Back

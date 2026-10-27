@@ -6,6 +6,7 @@ import com.datasync.domain.exception.LedgerPointUnknownSeriesException;
 import com.datasync.domain.exception.LedgerPointValidationException;
 import com.datasync.domain.exception.OrionAuthException;
 import com.datasync.domain.exception.OrionClientException;
+import com.datasync.domain.exception.OrionDataException;
 import com.datasync.domain.exception.OrionTransientException;
 import com.datasync.domain.exception.UnsupportedGranularityException;
 import com.datasync.domain.exception.UnsupportedTimeZoneException;
@@ -39,6 +40,7 @@ import com.datasync.domain.service.GapDetector;
 import com.datasync.domain.service.IntervalAssigner;
 import com.datasync.domain.service.MonthChunker;
 import com.datasync.domain.service.StalenessChecker;
+import com.datasync.domain.service.SyncWindowRules;
 import com.datasync.domain.service.UnitMapper;
 import io.github.resilience4j.ratelimiter.RequestNotPermitted;
 import org.slf4j.Logger;
@@ -115,47 +117,53 @@ public class SeriesSyncWorker {
 
     TaskOutcome process(Long taskId, SeriesDescriptor series, LocalDate windowStart, LocalDate windowEnd,
                          UUID correlationId, AtomicBoolean jobAborted) {
+        // Values LedgerPoint already accepted for completed chunks, so a Task that fails later still reports them.
+        TaskProgress progress = new TaskProgress();
         try {
-            return processInternal(taskId, series, windowStart, windowEnd, correlationId, jobAborted);
+            return processInternal(taskId, series, windowStart, windowEnd, correlationId, jobAborted, progress);
         } catch (JobAbortedException ex) {
-            return fail(taskId, FailureReason.TARGET_UNAVAILABLE, ex.getMessage());
+            return fail(taskId, FailureReason.TARGET_UNAVAILABLE, ex.getMessage(), progress.valuesSent);
         } catch (UnsupportedGranularityException ex) {
-            return fail(taskId, FailureReason.UNSUPPORTED_GRANULARITY, ex.getMessage());
+            return fail(taskId, FailureReason.UNSUPPORTED_GRANULARITY, ex.getMessage(), progress.valuesSent);
         } catch (UnsupportedTimeZoneException ex) {
-            return fail(taskId, FailureReason.UNSUPPORTED_TIMEZONE, ex.getMessage());
+            return fail(taskId, FailureReason.UNSUPPORTED_TIMEZONE, ex.getMessage(), progress.valuesSent);
         } catch (LedgerPointValidationException ex) {
             // L2: LedgerPoint's 400 carries the per-row reasons; surface them instead of the bare
             // "rejected the batch" message so an operator can see why without reproducing the call.
-            return fail(taskId, FailureReason.TARGET_REJECTED, describe(ex));
+            return fail(taskId, FailureReason.TARGET_REJECTED, describe(ex), progress.valuesSent);
         } catch (LedgerPointUnknownSeriesException ex) {
-            return fail(taskId, FailureReason.UNKNOWN_SERIES, ex.getMessage());
+            return fail(taskId, FailureReason.UNKNOWN_SERIES, ex.getMessage(), progress.valuesSent);
         } catch (LedgerPointTransientException ex) {
-            return fail(taskId, FailureReason.TARGET_UNAVAILABLE, ex.getMessage());
+            return fail(taskId, FailureReason.TARGET_UNAVAILABLE, ex.getMessage(), progress.valuesSent);
         } catch (LedgerPointAuthException ex) {
             // Spec §8: a LedgerPoint auth failure must fail the whole Job immediately, not just
             // this Task. Raise the shared flag so sibling Tasks stop at their next checkpoint; the
             // returned flag lets the caller mark the Job FAILED.
             jobAborted.set(true);
             taskRepositoryPort.updateTaskStatus(taskId, TaskStatus.FAILED, FailureReason.TARGET_UNAVAILABLE,
-                    safeDetail(ex.getMessage()), 0);
+                    safeDetail(ex.getMessage()), progress.valuesSent);
             return new TaskOutcome(TaskStatus.FAILED, true);
+        } catch (OrionDataException ex) {
+            // Orion's payload could not be interpreted: no retry would help and there is no stack worth logging.
+            return fail(taskId, FailureReason.INTERNAL_ERROR, ex.getMessage(), progress.valuesSent);
         } catch (OrionAuthException | OrionTransientException | OrionClientException ex) {
-            return fail(taskId, FailureReason.SOURCE_UNAVAILABLE, ex.getMessage());
+            return fail(taskId, FailureReason.SOURCE_UNAVAILABLE, ex.getMessage(), progress.valuesSent);
         } catch (RequestNotPermitted ex) {
             // The shared Orion rate limiter (5 req/s, ADR-004) could not hand out a permit within
             // its wait timeout. Without this the Task would stay PENDING forever.
             return fail(taskId, FailureReason.SOURCE_UNAVAILABLE,
-                    "Timed out waiting for an Orion rate-limiter permit: " + ex.getMessage());
+                    "Timed out waiting for an Orion rate-limiter permit: " + ex.getMessage(), progress.valuesSent);
         } catch (RuntimeException ex) {
             // Last line of defence: an unexpected bug must not leave the Task PENDING (spec 8.1).
             log.error("Task {} failed unexpectedly", taskId, ex);
             return fail(taskId, FailureReason.INTERNAL_ERROR,
-                    ex.getClass().getSimpleName() + ": " + ex.getMessage());
+                    ex.getClass().getSimpleName() + ": " + ex.getMessage(), progress.valuesSent);
         }
     }
 
     private TaskOutcome processInternal(Long taskId, SeriesDescriptor series, LocalDate windowStart,
-                                         LocalDate windowEnd, UUID correlationId, AtomicBoolean jobAborted) {
+                                         LocalDate windowEnd, UUID correlationId, AtomicBoolean jobAborted,
+                                         TaskProgress progress) {
         throwIfAborted(jobAborted);
 
         // L4: from here the Task is genuinely in flight. Recording RUNNING + started_at now (not at the
@@ -175,6 +183,13 @@ public class SeriesSyncWorker {
                     "Unsupported Orion timezone code: " + series.orionTimeZoneCode());
         }
 
+        if (series.catalogIssue() != null) {
+            // Checked after the skip rule and the timezone, so a skipped series stays SKIPPED and an unsupported
+            // timezone keeps its specific reason. Spec §8.1 has no data-quality code, hence INTERNAL_ERROR.
+            return fail(taskId, FailureReason.INTERNAL_ERROR,
+                    "Orion returned an invalid catalog entry for this series: " + series.catalogIssue());
+        }
+
         if (windowStart.isAfter(windowEnd)) {
             return fail(taskId, FailureReason.NO_DATA, "Requested window is empty: " + windowStart
                     + " is after " + windowEnd);
@@ -190,7 +205,6 @@ public class SeriesSyncWorker {
         List<DateRange> chunks = MonthChunker.chunkByMonth(windowStart, windowEnd);
 
         int totalRawValuesSeen = 0;
-        int totalValuesSent = 0;
         boolean anyWarnings = false;
         LocalDate latestReceivedDate = null;
 
@@ -198,7 +212,7 @@ public class SeriesSyncWorker {
             throwIfAborted(jobAborted);
             ChunkResult result = processChunk(taskId, series, ledgerPointKey, chunk, correlationId, jobAborted);
             totalRawValuesSeen += result.rawValuesSeen();
-            totalValuesSent += result.valuesSent();
+            progress.valuesSent += result.valuesSent();
             anyWarnings = anyWarnings || result.hasWarnings();
             if (result.latestLocalDate() != null
                     && (latestReceivedDate == null || result.latestLocalDate().isAfter(latestReceivedDate))) {
@@ -214,14 +228,21 @@ public class SeriesSyncWorker {
         // is normalized to the end of the month and may lie in the future. It never moves backwards
         // (e.g. when a caller re-processes an older window).
         LocalDate previous = series.lastSyncedDate();
-        LocalDate newLastSynced = previous != null && previous.isAfter(latestReceivedDate)
-                ? previous : latestReceivedDate;
-        seriesRepositoryPort.updateLastSyncedDate(series.id(), newLastSynced);
+        if (SyncWindowRules.mayAdvanceWatermark(windowStart, previous, clock.now())) {
+            LocalDate newLastSynced = previous != null && previous.isAfter(latestReceivedDate)
+                    ? previous : latestReceivedDate;
+            seriesRepositoryPort.updateLastSyncedDate(series.id(), newLastSynced);
+        } else {
+            // A window that starts after the watermark leaves the dates in between unsynced; moving the
+            // watermark would make every later default run skip them.
+            log.info("Task {}: last synced date left at {} because the window starts {}, after it",
+                    taskId, previous, windowStart);
+        }
         TaskStatus finalStatus = anyWarnings ? TaskStatus.SUCCESS_WITH_WARNINGS : TaskStatus.SUCCESS;
-        taskRepositoryPort.updateTaskStatus(taskId, finalStatus, null, null, totalValuesSent);
+        taskRepositoryPort.updateTaskStatus(taskId, finalStatus, null, null, progress.valuesSent);
         // Lifecycle log: task outcome (cid/job/series are added by the log pattern from MDC).
         log.info("Task {} finished {}: valuesSent={}, window={}..{}",
-                taskId, finalStatus, totalValuesSent, windowStart, windowEnd);
+                taskId, finalStatus, progress.valuesSent, windowStart, windowEnd);
         return new TaskOutcome(finalStatus, false);
     }
 
@@ -291,6 +312,7 @@ public class SeriesSyncWorker {
             UUID ledgerPointBatchId = null;
             if (!toSend.isEmpty()) {
                 throwIfAborted(jobAborted);
+                // May be null when Orion sent no unit: it only feeds the log/audit label (spec §6.6), so that is safe.
                 String unitCode = UnitMapper.map(fetched.unit());
                 String timeZoneCode = fetched.timeZone().ledgerPointCode();
                 LedgerPointPublishResult publishResult =
@@ -302,7 +324,12 @@ public class SeriesSyncWorker {
                 lastStage = ChunkStatus.PUBLISHED;
 
                 // Persist only after LedgerPoint accepted the batch (spec §8 "Partial months").
-                List<NormalizedSeriesValue> toPersist = toSend.stream().map(ClassifiedSeriesValue::value).toList();
+                // DECISION (spring-forward fillers, "option B"): derived filler rows are sent but never stored -
+                // they share the next real interval's instant, i.e. its series_value primary key.
+                List<NormalizedSeriesValue> toPersist = toSend.stream()
+                        .map(ClassifiedSeriesValue::value)
+                        .filter(value -> !value.filler())
+                        .toList();
                 seriesValuePort.upsertAll(series.id(), toPersist);
             }
 
@@ -332,8 +359,11 @@ public class SeriesSyncWorker {
         }
     }
 
+    // Counts cover values Orion sent; derived fillers only show up in "sent" (they are re-derived, not stored).
     private int countByType(List<ClassifiedSeriesValue> classified, ChangeType type) {
-        return (int) classified.stream().filter(c -> c.changeType() == type).count();
+        return (int) classified.stream()
+                .filter(c -> !c.value().filler() && c.changeType() == type)
+                .count();
     }
 
     private static void throwIfAborted(AtomicBoolean jobAborted) {
@@ -352,10 +382,20 @@ public class SeriesSyncWorker {
     }
 
     private TaskOutcome fail(Long taskId, FailureReason reason, String detail) {
+        return fail(taskId, reason, detail, 0);
+    }
+
+    /** {@code valuesSent}: what earlier chunks of this Task already delivered to LedgerPoint before it failed. */
+    private TaskOutcome fail(Long taskId, FailureReason reason, String detail, int valuesSent) {
         String safe = safeDetail(detail);
         log.warn("Task {} failed: {} - {}", taskId, reason, safe);
-        taskRepositoryPort.updateTaskStatus(taskId, TaskStatus.FAILED, reason, safe, 0);
+        taskRepositoryPort.updateTaskStatus(taskId, TaskStatus.FAILED, reason, safe, valuesSent);
         return new TaskOutcome(TaskStatus.FAILED, false);
+    }
+
+    /** Mutable per-Task counter shared between {@link #process} and {@link #processInternal}. */
+    private static final class TaskProgress {
+        private int valuesSent;
     }
 
     /**

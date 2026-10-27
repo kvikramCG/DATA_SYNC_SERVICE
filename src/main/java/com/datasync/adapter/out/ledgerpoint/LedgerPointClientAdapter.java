@@ -1,9 +1,11 @@
 package com.datasync.adapter.out.ledgerpoint;
 
+import com.datasync.adapter.out.http.RetryAfterSupport;
 import com.datasync.adapter.out.ledgerpoint.dto.LedgerPointBatchResponseDto;
 import com.datasync.adapter.out.ledgerpoint.dto.LedgerPointErrorResponseDto;
 import com.datasync.adapter.out.ledgerpoint.dto.LedgerPointValueRowDto;
 import com.datasync.domain.exception.LedgerPointAuthException;
+import com.datasync.domain.exception.LedgerPointRateLimitedException;
 import com.datasync.domain.exception.LedgerPointTransientException;
 import com.datasync.domain.exception.LedgerPointUnknownSeriesException;
 import com.datasync.domain.exception.LedgerPointValidationException;
@@ -31,6 +33,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 /**
@@ -75,23 +78,69 @@ public class LedgerPointClientAdapter implements SeriesPublisherPort {
 
         for (List<ClassifiedSeriesValue> batch : batches) {
             LedgerPointBatchResponseDto response = publishBatchWithRetry(key, unitCode, timeZoneCode, batch, correlationId);
+            if (response == null) {
+                // Spec §5.1: a 200 means the batch was accepted, so an empty body is not a failure.
+                log.warn("LedgerPoint accepted a batch of {} rows but returned no response body", batch.size());
+                continue;
+            }
             totalReceived += response.received();
             totalInserted += response.inserted();
             totalUpdated += response.updated();
-            if (response.batchId() != null) {
-                batchIds.add(UUID.fromString(response.batchId()));
+            UUID batchId = parseBatchId(response.batchId());
+            if (batchId != null) {
+                batchIds.add(batchId);
             }
         }
         return new LedgerPointPublishResult(totalReceived, totalInserted, totalUpdated, batchIds);
     }
 
+    /**
+     * The batch id is audit information only: LedgerPoint has already accepted the data, so a missing or
+     * non-UUID id must not fail the Task. It is logged as received and simply not stored.
+     */
+    private UUID parseBatchId(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(raw.trim());
+        } catch (IllegalArgumentException e) {
+            String safe = raw.replaceAll("\\p{Cntrl}", " ");
+            log.warn("LedgerPoint returned a batchId that is not a UUID, it is not stored: '{}'",
+                    safe.length() > 64 ? safe.substring(0, 64) + "..." : safe);
+            return null;
+        }
+    }
+
     private LedgerPointBatchResponseDto publishBatchWithRetry(String key, String unitCode, String timeZoneCode,
                                                                List<ClassifiedSeriesValue> batch, UUID correlationId) {
         Supplier<LedgerPointBatchResponseDto> decorated =
-                Decorators.ofSupplier(() -> publishBatch(key, unitCode, timeZoneCode, batch, correlationId))
+                Decorators.ofSupplier(honoringRetryAfter(
+                                () -> publishBatch(key, unitCode, timeZoneCode, batch, correlationId)))
                         .withRetry(retry)
                         .decorate();
         return decorated.get();
+    }
+
+    /**
+     * Honors LedgerPoint's {@code Retry-After} on a 429 like the Orion adapter does (spec &sect;8): wait the
+     * requested time (capped by {@code ledgerpoint.max-retry-after}) before the retry policy's own backoff.
+     * No wait follows the last allowed attempt, because no retry follows it.
+     */
+    private <T> Supplier<T> honoringRetryAfter(Supplier<T> call) {
+        AtomicInteger attempts = new AtomicInteger();
+        return () -> {
+            int attempt = attempts.incrementAndGet();
+            try {
+                return call.get();
+            } catch (LedgerPointRateLimitedException rateLimited) {
+                if (attempt < retry.getRetryConfig().getMaxAttempts()) {
+                    RetryAfterSupport.pause(rateLimited.getRetryAfter(), properties.getMaxRetryAfter(),
+                            "LedgerPoint", log);
+                }
+                throw rateLimited;
+            }
+        };
     }
 
     private LedgerPointBatchResponseDto publishBatch(String key, String unitCode, String timeZoneCode,
@@ -121,6 +170,10 @@ public class LedgerPointClientAdapter implements SeriesPublisherPort {
                     .onStatus(status -> status.value() == 400, (req, res) -> {
                         throw new LedgerPointValidationException("LedgerPoint rejected the batch", readErrors(res.getBody()));
                     })
+                    .onStatus(status -> status.value() == 429, (req, res) -> {
+                        throw new LedgerPointRateLimitedException("LedgerPoint rate limited the request (429)",
+                                RetryAfterSupport.parse(res.getHeaders(), log));
+                    })
                     .onStatus(HttpStatusCode::is5xxServerError, (req, res) -> {
                         throw new LedgerPointTransientException("LedgerPoint transient error: " + res.getStatusCode());
                     })
@@ -133,6 +186,9 @@ public class LedgerPointClientAdapter implements SeriesPublisherPort {
             throw e;
         } catch (LedgerPointValidationException e) {
             outcome = "validation_error";
+            throw e;
+        } catch (LedgerPointRateLimitedException e) {
+            outcome = "rate_limited";
             throw e;
         } catch (LedgerPointTransientException e) {
             outcome = "transient_error";

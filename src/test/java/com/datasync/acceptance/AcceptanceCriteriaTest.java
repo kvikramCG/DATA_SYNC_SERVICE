@@ -254,6 +254,41 @@ class AcceptanceCriteriaTest {
     }
 
     @Test
+    void criterion04b_rerunningASpringForwardDaySendsNothingAndAChangedValueResendsItsFiller() {
+        stubSeriesList("SERIES_ALPHA_001");
+        Instant day = Instant.parse("2026-03-08T00:00:00Z");
+
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 60, springForwardDayValues("22.10")));
+        sync(day, day);
+        assertThat(postedRows()).hasSize(24);
+
+        // Fillers are derived, not stored: an unchanged day must not resend the filler (spec AC6).
+        wireMock.resetRequests();
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 60, springForwardDayValues("22.10")));
+        sync(day, day);
+        assertThat(postedRows()).isEmpty();
+
+        // The value the filler copies changed: both the real row and its filler go out (spec AC7 + 6.4).
+        wireMock.resetRequests();
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 60, springForwardDayValues("25.00")));
+        sync(day, day);
+        List<JsonNode> rows = postedRows();
+        assertThat(rows).extracting(r -> r.get("interval").asText()).containsExactlyInAnyOrder("2", "3");
+        assertThat(rowFor(rows, "2")).isEqualTo("25.00");
+        assertThat(rowFor(rows, "3")).isEqualTo("25.00");
+    }
+
+    private String[] springForwardDayValues(String oneAmValue) {
+        List<String> values = new ArrayList<>();
+        values.add(value(LocalDateTime.of(2026, 3, 8, 0, 0), false, "20.00"));
+        values.add(value(LocalDateTime.of(2026, 3, 8, 1, 0), false, oneAmValue));
+        for (int hour = 3; hour < 24; hour++) {
+            values.add(value(LocalDateTime.of(2026, 3, 8, hour, 0), false, hour == 3 ? "23.40" : "30.00"));
+        }
+        return values.toArray(String[]::new);
+    }
+
+    @Test
     void criterion05_fifteenMinuteDataUsesIntervals1To96AndDailyDataUsesInterval1() {
         stubSeriesList("SERIES_ALPHA_001");
         stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 15,
@@ -581,6 +616,21 @@ class AcceptanceCriteriaTest {
     }
 
     @Test
+    void failure10_ledgerPoint429IsRetriedAndExhaustsAsTargetUnavailable() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+        wireMock.stubFor(post(urlEqualTo(LEDGERPOINT_PATH)).atPriority(1).willReturn(aResponse().withStatus(429)));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.TARGET_UNAVAILABLE);
+        wireMock.verify(3, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH))); // same 3 attempts as Orion (spec §8)
+    }
+
+    @Test
     void failure10_ledgerPoint401FailsTheWholeJobAndLeavesNoTaskUnfinished() {
         stubSeriesList("SERIES_ALPHA_001", "SERIES_BETA_002", "SERIES_GAMMA_003");
         for (String name : List.of("SERIES_ALPHA_001", "SERIES_BETA_002", "SERIES_GAMMA_003")) {
@@ -621,7 +671,9 @@ class AcceptanceCriteriaTest {
         JobTask resent = tasksByName(second).get("SERIES_ALPHA_001");
         assertThat(resent.status()).isEqualTo(TaskStatus.SUCCESS);
         assertThat(resent.valuesSent()).isEqualTo(1); // nothing was stored by the rejected run, so it is NEW again
-        assertThat(store.lastSyncedDate("SERIES_ALPHA_001")).isEqualTo(LocalDate.of(2026, 11, 1));
+        // The window starts after the one-year default start, so it is not contiguous with "never synced":
+        // the watermark must stay put rather than skip the dates in between.
+        assertThat(store.lastSyncedDate("SERIES_ALPHA_001")).isNull();
 
         wireMock.resetRequests();
         sync(NOV_1, NOV_1);
@@ -655,13 +707,38 @@ class AcceptanceCriteriaTest {
     }
 
     @Test
-    void edge01_aSeriesNameThatOrionDoesNotListCompletesWithNoTasks() {
+    void edge01_aSeriesNameThatOrionDoesNotListCompletesWithNoTasksAndLogsAWarning() {
         stubSeriesList("SERIES_ALPHA_001");
+        ch.qos.logback.classic.Logger appLogger =
+                (ch.qos.logback.classic.Logger) LoggerFactory.getLogger("com.datasync");
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        appLogger.addAppender(appender);
+        try {
+            JobSummary summary = sync("DOES_NOT_EXIST\nforged line", NOV_1, NOV_1);
 
-        JobSummary summary = sync("DOES_NOT_EXIST", NOV_1, NOV_1);
+            assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED);
+            assertThat(summary.taskCounts()).isEmpty();
+        } finally {
+            appLogger.detachAppender(appender);
+        }
 
-        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED);
-        assertThat(summary.taskCounts()).isEmpty();
+        assertThat(appender.list)
+                .filteredOn(event -> event.getLevel() == Level.WARN)
+                .extracting(ILoggingEvent::getFormattedMessage)
+                .anySatisfy(message -> assertThat(message)
+                        .contains("no series named 'DOES_NOT_EXIST forged line'") // newline replaced
+                        .doesNotContain("\n"));
+    }
+
+    @Test
+    void edge_aSeriesNameLongerThanTheColumnIsRejectedAsABadRequestBeforeAnyJobExists() {
+        String tooLong = "S".repeat(101);
+
+        assertThatThrownBy(() -> service.triggerSync(SeriesType.TYPE_A, tooLong, null, null, UUID.randomUUID()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("100 characters");
+        assertThat(store.jobCount()).isZero();
     }
 
     @Test
@@ -774,6 +851,68 @@ class AcceptanceCriteriaTest {
         assertThat(task.valuesSent()).isEqualTo(2);
         assertThat(postedRows()).extracting(r -> r.get("interval").asText()).containsExactlyInAnyOrder("1", "2");
         assertThat(store.warningCount()).isEqualTo(22); // intervals 3..24 of that day
+    }
+
+    @Test
+    void edge_aSeriesWithAMissingCatalogDateFailsOnlyItsOwnTask() {
+        stubSeriesJson(
+                "{\"seriesName\":\"SERIES_BROKEN\",\"seriesType\":\"typeA\",\"timeZone\":6,"
+                        + "\"earliestDataDate\":\"1/1/2020 12:00:00 AM\",\"latestDataDate\":\"11/30/2026 11:00:00 PM\"}",
+                seriesJson("SERIES_ALPHA_001", 6, "10/12/2026 6:00:00 PM"));
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 1440,
+                value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        assertThat(summary.status()).isEqualTo(JobStatus.COMPLETED_WITH_FAILURES);
+        JobTask broken = tasksByName(summary).get("SERIES_BROKEN");
+        assertThat(broken.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(broken.failureReason()).isEqualTo(FailureReason.INTERNAL_ERROR);
+        assertThat(broken.failureDetail()).contains("lastUpdatedDate is missing");
+        assertThat(tasksByName(summary).get("SERIES_ALPHA_001").status()).isEqualTo(TaskStatus.SUCCESS);
+    }
+
+    @Test
+    void edge_aValueWithNoReadingIsAGapWarningAndTheRestIsStillSent() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 60,
+                value(LocalDateTime.of(2026, 11, 2, 0, 0), false, "1"),
+                value(LocalDateTime.of(2026, 11, 2, 1, 0), false, "null"),
+                value(LocalDateTime.of(2026, 11, 2, 2, 0), false, "3")));
+
+        JobSummary summary = sync(Instant.parse("2026-11-02T00:00:00Z"), Instant.parse("2026-11-02T00:00:00Z"));
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.SUCCESS_WITH_WARNINGS);
+        assertThat(postedRows()).extracting(r -> r.get("interval").asText()).containsExactlyInAnyOrder("1", "3");
+    }
+
+    @Test
+    void edge_aValueWithAnUnreadableStartDateFailsThatSeriesWithInternalError() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", valuesBody("SERIES_ALPHA_001", 60,
+                "{\"startDate\":\"garbage\",\"repeatedHour\":false,\"value\":1}"));
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        JobTask task = tasksByName(summary).get("SERIES_ALPHA_001");
+        assertThat(task.status()).isEqualTo(TaskStatus.FAILED);
+        assertThat(task.failureReason()).isEqualTo(FailureReason.INTERNAL_ERROR);
+        assertThat(task.failureDetail()).contains("unreadable startDate 'garbage'");
+        wireMock.verify(0, postRequestedFor(urlEqualTo(LEDGERPOINT_PATH)));
+    }
+
+    @Test
+    void edge_aMissingUnitDoesNotStopTheValuesFromBeingSent() {
+        stubSeriesList("SERIES_ALPHA_001");
+        stubValues("SERIES_ALPHA_001", "{\"seriesName\":\"SERIES_ALPHA_001\",\"granularity\":1440,\"timeZone\":6,"
+                + "\"asOfDate\":\"bad\",\"values\":[" + value(LocalDateTime.of(2026, 11, 1, 0, 0), false, "31.25")
+                + "]}");
+
+        JobSummary summary = sync(NOV_1, NOV_1);
+
+        assertThat(tasksByName(summary).get("SERIES_ALPHA_001").status()).isEqualTo(TaskStatus.SUCCESS);
+        assertThat(postedRows()).hasSize(1);
     }
 
     @Test
@@ -1072,6 +1211,10 @@ class AcceptanceCriteriaTest {
             return nextId++;
         }
 
+        synchronized int jobCount() {
+            return jobs.size();
+        }
+
         synchronized void addOverride(SeriesRuleOverride override) {
             overrides.put(override.orionSeriesName(), override);
         }
@@ -1182,7 +1325,7 @@ class AcceptanceCriteriaTest {
                         d.lastUpdatedDate(), d.earliestDataDate(), d.latestDataDate(),
                         existing != null ? existing.lastSyncedDate() : null, d.orionTimeZoneCode());
                 series.put(d.name(), stored);
-                result.add(stored);
+                result.add(stored.withCatalogIssue(d.catalogIssue()));
             }
             return result;
         }

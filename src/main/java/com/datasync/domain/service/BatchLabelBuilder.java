@@ -11,11 +11,15 @@ import java.util.List;
  */
 public final class BatchLabelBuilder {
 
+    /** Shown in the label when Orion sent no unit; the label is only logged (never sent to LedgerPoint). */
+    static final String NO_UNIT = "NA";
+
     private BatchLabelBuilder() {
     }
 
     public static String build(List<ChangeType> changeTypes, String key, String unitCode, String timeZoneCode) {
         String prefix = changeTypes.stream().allMatch(type -> type == ChangeType.NEW) ? "INS" : "UPD";
-        return prefix + "_" + key + "_" + unitCode + "_" + timeZoneCode;
+        String unit = unitCode == null || unitCode.isBlank() ? NO_UNIT : unitCode;
+        return prefix + "_" + key + "_" + unit + "_" + timeZoneCode;
     }
 }

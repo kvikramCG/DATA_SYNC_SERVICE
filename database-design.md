@@ -276,9 +276,9 @@ reason) only require an application-side change, not a migration that alters a t
 | 1 | Sync every series, correct `taskCounts` | `job_task.status` grouped by `job_id` reproduces `taskCounts` exactly |
 | 2 | 3-month window → exactly 3 Orion calls | `job_task_chunk` rows (one per month) with `orion_call_count`, queryable per `job_task_id` |
 | 3 | Fall-back day → 25 rows incl. one `Nx` | `series_value.interval_number` stores the literal token (e.g. `2x`); `repeated_hour=true` row coexists with `repeated_hour=false` row at the same `interval_number` prefix |
-| 4 | Spring-forward → 24 rows, filled, no `x` | filled row persisted like any other `series_value` row; no `task_warning` is recorded for the fill (it is silent, spec §6.4/§6.8) |
+| 4 | Spring-forward → 24 rows, filled, no `x` | **DECISION (option B): the filled row is NOT stored in `series_value`.** It is derived on every run (it shares the next real interval's `start_instant`, i.e. its primary key, so it cannot be stored) and sent to LedgerPoint only when the interval it copies is new/updated; no `task_warning` is recorded for the fill (it is silent, spec §6.4/§6.8) |
 | 5 | 15-min → `1..96`; daily → `1` | `interval_number` computed per §6.3 and stored verbatim; no schema constraint needed since computation is domain logic |
-| 6 | Re-run sends 0 values | diff compares incoming values against existing `series_value` PK `(series_id, start_instant, repeated_hour)`; all match ⇒ `values_unchanged` in `job_task_chunk`, nothing posted |
+| 6 | Re-run sends 0 values | diff compares incoming values against existing `series_value` PK `(series_id, start_instant, repeated_hour)`; all match ⇒ `values_unchanged` in `job_task_chunk`, nothing posted (a spring-forward filler follows its source interval, so it is not sent either) |
 | 7 | Change one value → sends exactly 1 | same PK lookup finds one row where `value` differs ⇒ classified `values_updated=1` |
 | 8 | Orion 429 → retry succeeds | not a schema concern; `job_task_chunk.orion_call_count` shows >1 when a retry re-issued the call |
 | 9 | Orion 401 mid-run → refresh, continue | not a schema concern (token cache is in-memory in the adapter) |

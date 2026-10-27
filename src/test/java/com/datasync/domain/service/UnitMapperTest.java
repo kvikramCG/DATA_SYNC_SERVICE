@@ -18,4 +18,10 @@ class UnitMapperTest {
     void passesThroughUnknownUnits() {
         assertThat(UnitMapper.map("SOMETHING_ELSE")).isEqualTo("SOMETHING_ELSE");
     }
+
+    @Test
+    void aMissingUnitDoesNotFailAndStaysMissing() {
+        assertThat(UnitMapper.map(null)).isNull();
+        assertThat(UnitMapper.map("")).isEmpty();
+    }
 }

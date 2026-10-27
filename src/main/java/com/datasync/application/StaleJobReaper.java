@@ -39,7 +39,7 @@ public class StaleJobReaper {
                           TaskRepositoryPort taskRepositoryPort,
                           JobAbortRegistry abortRegistry,
                           ClockPort clock,
-                          @Value("${datasync.job.max-running-duration:PT2H}") Duration maxRunningDuration) {
+                          @Value("${datasync.job.max-running-duration:PT6H}") Duration maxRunningDuration) {
         this.jobRepositoryPort = jobRepositoryPort;
         this.taskRepositoryPort = taskRepositoryPort;
         this.abortRegistry = abortRegistry;

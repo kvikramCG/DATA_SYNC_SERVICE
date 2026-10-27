@@ -1,6 +1,7 @@
 package com.datasync.adapter.out.orion;
 
 import com.datasync.domain.exception.OrionAuthException;
+import com.datasync.domain.exception.OrionTransientException;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -90,8 +91,29 @@ class OrionTokenCacheTest {
     }
 
     @Test
-    void loginEndpointErrorSurfacesAsAnAuthException() {
+    void aBadCredentialsResponseSurfacesAsAnAuthException() {
+        wireMock.stubFor(post(urlEqualTo("/auth/token")).willReturn(aResponse().withStatus(401)));
+
+        assertThatThrownBy(cache::getToken).isInstanceOf(OrionAuthException.class);
+    }
+
+    @Test
+    void aServerErrorOnTheLoginEndpointIsTransientSoItCanBeRetried() {
         wireMock.stubFor(post(urlEqualTo("/auth/token")).willReturn(aResponse().withStatus(500)));
+
+        assertThatThrownBy(cache::getToken).isInstanceOf(OrionTransientException.class);
+    }
+
+    @Test
+    void aNetworkFailureOnTheLoginEndpointIsTransient() {
+        wireMock.stop(); // nothing listens any more: connection refused
+
+        assertThatThrownBy(cache::getToken).isInstanceOf(OrionTransientException.class);
+    }
+
+    @Test
+    void aTokenResponseWithoutAnAccessTokenIsRejected() {
+        wireMock.stubFor(post(urlEqualTo("/auth/token")).willReturn(okJson("{\"expiresInSeconds\":3600}")));
 
         assertThatThrownBy(cache::getToken).isInstanceOf(OrionAuthException.class);
     }

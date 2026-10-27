@@ -168,6 +168,86 @@ class LedgerPointClientAdapterTest {
     }
 
     @Test
+    void retriesOn429ThenSucceedsAndCountsItAsRateLimited() {
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("lp-429")
+                .whenScenarioStateIs(STARTED)
+                .willReturn(aResponse().withStatus(429))
+                .willSetStateTo("recovered"));
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("lp-429")
+                .whenScenarioStateIs("recovered")
+                .willReturn(okJson("""
+                        {"batchId":"f7c1e2a4-1b2c-4d5e-9f00-1234567890ab","received":1,"inserted":1,"updated":0}
+                        """)));
+
+        LedgerPointPublishResult result = adapter(10_000).publish(
+                "SERIES_ALPHA_001", "U1", "TZ_C", List.of(classified("31.25", ChangeType.NEW)), correlationId);
+
+        assertThat(result.inserted()).isEqualTo(1);
+        assertThat(ledgerPointRequests("rate_limited")).isEqualTo(1);
+        wireMockServer.verify(2, postRequestedFor(urlEqualTo("/api/v2/series/values")));
+    }
+
+    @Test
+    void a429OnEveryAttemptExhaustsTheThreeTriesAsATransientFailure() {
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).willReturn(aResponse().withStatus(429)));
+
+        assertThatThrownBy(() -> adapter(10_000).publish(
+                "SERIES_ALPHA_001", "U1", "TZ_C", List.of(classified("31.25", ChangeType.NEW)), correlationId))
+                .isInstanceOf(LedgerPointTransientException.class);
+
+        wireMockServer.verify(3, postRequestedFor(urlEqualTo("/api/v2/series/values")));
+    }
+
+    @Test
+    void honorsRetryAfterOn429CappedByTheConfiguredMaximum() {
+        properties.setMaxRetryAfter(Duration.ofMillis(400));
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("lp-429-wait")
+                .whenScenarioStateIs(STARTED)
+                .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "30"))
+                .willSetStateTo("recovered"));
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("lp-429-wait")
+                .whenScenarioStateIs("recovered")
+                .willReturn(okJson("""
+                        {"batchId":"f7c1e2a4-1b2c-4d5e-9f00-1234567890ab","received":1,"inserted":1,"updated":0}
+                        """)));
+
+        long start = System.nanoTime();
+        adapter(10_000).publish("SERIES_ALPHA_001", "U1", "TZ_C",
+                List.of(classified("31.25", ChangeType.NEW)), correlationId);
+        long elapsedMs = Duration.ofNanos(System.nanoTime() - start).toMillis();
+
+        // Waited the capped 400 ms (not the 30 s the server asked for).
+        assertThat(elapsedMs).isBetween(350L, 5_000L);
+    }
+
+    @Test
+    void aMissingOrNonUuidBatchIdDoesNotFailTheBatch() {
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("batch-ids")
+                .whenScenarioStateIs(STARTED)
+                .willReturn(okJson("{\"batchId\":\"not-a-uuid\",\"received\":1,\"inserted\":1,\"updated\":0}"))
+                .willSetStateTo("second"));
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).inScenario("batch-ids")
+                .whenScenarioStateIs("second")
+                .willReturn(okJson("{\"batchId\":null,\"received\":1,\"inserted\":1,\"updated\":0}")));
+
+        LedgerPointPublishResult result = adapter(1).publish("SERIES_ALPHA_001", "U1", "TZ_C",
+                List.of(classified("1", ChangeType.NEW), classified("2", ChangeType.NEW)), correlationId);
+
+        assertThat(result.received()).isEqualTo(2);
+        assertThat(result.batchIds()).isEmpty();
+    }
+
+    @Test
+    void anEmptyBodyOn200IsTreatedAsAccepted() {
+        wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).willReturn(aResponse().withStatus(200)));
+
+        LedgerPointPublishResult result = adapter(10_000).publish("SERIES_ALPHA_001", "U1", "TZ_C",
+                List.of(classified("31.25", ChangeType.NEW)), correlationId);
+
+        assertThat(result.batchIds()).isEmpty();
+    }
+
+    @Test
     void sendsValuesAsPlainDecimalStringsNeverScientificNotation() {
         wireMockServer.stubFor(post(urlEqualTo("/api/v2/series/values")).willReturn(okJson("""
                 {"batchId":"f7c1e2a4-1b2c-4d5e-9f00-1234567890ab","received":1,"inserted":1,"updated":0}

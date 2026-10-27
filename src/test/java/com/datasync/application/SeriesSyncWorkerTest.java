@@ -2,6 +2,7 @@ package com.datasync.application;
 
 import com.datasync.domain.exception.LedgerPointAuthException;
 import com.datasync.domain.exception.LedgerPointValidationException;
+import com.datasync.domain.exception.OrionDataException;
 import com.datasync.domain.exception.OrionTransientException;
 import com.datasync.domain.model.ChunkStatus;
 import com.datasync.domain.model.FailureReason;
@@ -85,12 +86,14 @@ class SeriesSyncWorkerTest {
     private static final LocalDate WINDOW_END = LocalDate.of(2026, 10, 31);
     private static final LocalDate SINGLE_DAY = LocalDate.of(2026, 10, 15);
 
+    // lastSyncedDate = SINGLE_DAY: the windows used below start on or before it, i.e. they are contiguous with
+    // what is already synced, so a successful run may advance the watermark (see the guard tests further down).
     private final SeriesDescriptor series = new SeriesDescriptor(
             1L, "SERIES_ALPHA_001", SeriesType.TYPE_A, TimeZoneCode.CENTRAL,
             LocalDateTime.of(2026, 10, 12, 18, 0),
             LocalDateTime.of(2020, 1, 1, 0, 0),
             LocalDateTime.of(2026, 10, 13, 23, 0),
-            null);
+            SINGLE_DAY);
 
     @BeforeEach
     void setUp() {
@@ -223,6 +226,64 @@ class SeriesSyncWorkerTest {
         verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.FAILED),
                 eq(FailureReason.UNSUPPORTED_TIMEZONE), eq("Unsupported Orion timezone code: 99"), eq(0));
         verifyNoInteractions(seriesSourcePort, seriesPublisherPort);
+    }
+
+    @Test
+    void aSeriesWithAnInvalidCatalogEntryFailsItsTaskWithInternalErrorBeforeAnyCall() {
+        SeriesDescriptor broken = series.withCatalogIssue("lastUpdatedDate is missing");
+
+        TaskOutcome outcome = worker.process(TASK_ID, broken, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.FAILED);
+        verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.FAILED),
+                eq(FailureReason.INTERNAL_ERROR),
+                eq("Orion returned an invalid catalog entry for this series: lastUpdatedDate is missing"), eq(0));
+        verifyNoInteractions(seriesSourcePort, seriesPublisherPort);
+    }
+
+    @Test
+    void anInvalidCatalogEntryDoesNotOverrideASkipRule() {
+        SeriesDescriptor broken = series.withCatalogIssue("lastUpdatedDate is missing");
+        when(ruleOverrideRepositoryPort.findActiveByOrionSeriesName("SERIES_ALPHA_001"))
+                .thenReturn(java.util.Optional.of(new SeriesRuleOverride("SERIES_ALPHA_001", null, true)));
+
+        TaskOutcome outcome = worker.process(TASK_ID, broken, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.SKIPPED);
+    }
+
+    @Test
+    void unreadableOrionDataFailsTheTaskWithInternalErrorAndTheReadableMessage() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenThrow(new OrionDataException("Orion returned a value with an unreadable startDate 'x'"));
+
+        TaskOutcome outcome = worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.FAILED);
+        verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.FAILED),
+                eq(FailureReason.INTERNAL_ERROR),
+                eq("Orion returned a value with an unreadable startDate 'x'"), eq(0));
+    }
+
+    @Test
+    void aMissingUnitDoesNotFailTheTaskAndIsNotStored() {
+        SeriesValuesResult noUnit = new SeriesValuesResult(
+                "SERIES_ALPHA_001", null, 1440, TimeZoneCode.CENTRAL, null,
+                List.of(new RawSeriesValue(SINGLE_DAY.atStartOfDay(), false, new BigDecimal("31.25"))));
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any())).thenReturn(noUnit);
+        when(seriesValuePort.findExistingValues(eq(1L), any(), any())).thenReturn(Map.of());
+        when(seriesPublisherPort.publish(any(), any(), any(), anyList(), any()))
+                .thenReturn(new LedgerPointPublishResult(1, 1, 0, List.of()));
+
+        TaskOutcome outcome = worker.process(TASK_ID, series, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.SUCCESS);
+        verify(seriesRepositoryPort, never()).updateUnit(any(), any());
+        verify(seriesPublisherPort).publish(eq("SERIES_ALPHA_001"), eq(null), eq("TZ_C"), anyList(), any());
     }
 
     @Test
@@ -444,6 +505,67 @@ class SeriesSyncWorkerTest {
         worker.process(TASK_ID, alreadySynced, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(), new AtomicBoolean());
 
         verify(seriesRepositoryPort).updateLastSyncedDate(1L, alreadySyncedUpTo);
+    }
+
+    @Test
+    void aNeverSyncedSeriesWithAWindowAfterTheDefaultStartDoesNotMoveTheWatermark() {
+        SeriesDescriptor neverSynced = series.withLastSyncedDate(null);
+        stubOneSuccessfulDay();
+
+        TaskOutcome outcome = worker.process(TASK_ID, neverSynced, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.SUCCESS);
+        verify(seriesRepositoryPort, never()).updateLastSyncedDate(any(), any());
+    }
+
+    @Test
+    void aNeverSyncedSeriesWithAWindowFromTheDefaultStartMovesTheWatermark() {
+        SeriesDescriptor neverSynced = series.withLastSyncedDate(null);
+        stubOneSuccessfulDay();
+        LocalDate defaultStart = LocalDate.of(2025, 10, 14); // NOW (2026-10-14) minus one year
+
+        worker.process(TASK_ID, neverSynced, defaultStart, defaultStart, UUID.randomUUID(), new AtomicBoolean());
+
+        verify(seriesRepositoryPort).updateLastSyncedDate(1L, SINGLE_DAY);
+    }
+
+    @Test
+    void aSyncedSeriesWithAWindowStartingAfterTheWatermarkDoesNotMoveIt() {
+        SeriesDescriptor synced = series.withLastSyncedDate(LocalDate.of(2026, 10, 10));
+        stubOneSuccessfulDay();
+
+        TaskOutcome outcome = worker.process(TASK_ID, synced, SINGLE_DAY, SINGLE_DAY, UUID.randomUUID(),
+                new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.SUCCESS);
+        verify(seriesRepositoryPort, never()).updateLastSyncedDate(any(), any());
+    }
+
+    @Test
+    void aFailureInALaterChunkStillReportsTheValuesEarlierChunksSent() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenReturn(oneDailyValue(new BigDecimal("31.25")))
+                .thenThrow(new OrionTransientException("Orion is down"));
+        when(seriesValuePort.findExistingValues(eq(1L), any(), any())).thenReturn(Map.of());
+        when(seriesPublisherPort.publish(any(), any(), any(), anyList(), any()))
+                .thenReturn(new LedgerPointPublishResult(1, 1, 0, List.of()));
+
+        TaskOutcome outcome = worker.process(TASK_ID, series, WINDOW_START, LocalDate.of(2026, 11, 30),
+                UUID.randomUUID(), new AtomicBoolean());
+
+        assertThat(outcome.status()).isEqualTo(TaskStatus.FAILED);
+        verify(taskRepositoryPort).updateTaskStatus(eq(TASK_ID), eq(TaskStatus.FAILED),
+                eq(FailureReason.SOURCE_UNAVAILABLE), any(), eq(1));
+        verify(seriesRepositoryPort, never()).updateLastSyncedDate(any(), any());
+    }
+
+    private void stubOneSuccessfulDay() {
+        when(seriesSourcePort.fetchValues(eq("SERIES_ALPHA_001"), any(), any()))
+                .thenReturn(oneDailyValue(new BigDecimal("31.25")));
+        when(seriesValuePort.findExistingValues(eq(1L), any(), any())).thenReturn(Map.of());
+        when(seriesPublisherPort.publish(any(), any(), any(), anyList(), any()))
+                .thenReturn(new LedgerPointPublishResult(1, 1, 0, List.of()));
     }
 
     @Test

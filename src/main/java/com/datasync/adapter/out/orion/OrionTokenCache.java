@@ -3,9 +3,11 @@ package com.datasync.adapter.out.orion;
 import com.datasync.adapter.out.orion.dto.OrionTokenRequest;
 import com.datasync.adapter.out.orion.dto.OrionTokenResponse;
 import com.datasync.domain.exception.OrionAuthException;
+import com.datasync.domain.exception.OrionTransientException;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
 import java.time.Duration;
@@ -78,17 +80,27 @@ public class OrionTokenCache {
     }
 
     private CachedToken refresh() {
-        OrionTokenResponse response = orionRestClient.post()
-                .uri("/auth/token")
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(new OrionTokenRequest(properties.getLogin(), properties.getPassword()))
-                .retrieve()
-                .onStatus(HttpStatusCode::isError, (req, res) -> {
-                    throw new OrionAuthException("Failed to obtain Orion token: " + res.getStatusCode());
-                })
-                .body(OrionTokenResponse.class);
+        OrionTokenResponse response;
+        try {
+            response = orionRestClient.post()
+                    .uri("/auth/token")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(new OrionTokenRequest(properties.getLogin(), properties.getPassword()))
+                    .retrieve()
+                    // Spec §4.1 / §8: Orion's own 5xx is transient and retried; bad credentials (401) are not.
+                    .onStatus(HttpStatusCode::is5xxServerError, (req, res) -> {
+                        throw new OrionTransientException("Orion token endpoint error: " + res.getStatusCode());
+                    })
+                    .onStatus(HttpStatusCode::isError, (req, res) -> {
+                        throw new OrionAuthException("Failed to obtain Orion token: " + res.getStatusCode());
+                    })
+                    .body(OrionTokenResponse.class);
+        } catch (ResourceAccessException networkException) {
+            throw new OrionTransientException("Orion network error while obtaining a token: "
+                    + networkException.getMessage());
+        }
 
-        if (response == null) {
+        if (response == null || response.accessToken() == null || response.accessToken().isBlank()) {
             throw new OrionAuthException("Orion token response was empty");
         }
         return new CachedToken(response.accessToken(), Instant.now().plusSeconds(response.expiresInSeconds()));

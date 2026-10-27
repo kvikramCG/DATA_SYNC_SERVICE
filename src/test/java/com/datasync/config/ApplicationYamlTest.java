@@ -32,4 +32,16 @@ class ApplicationYamlTest {
     void shutdownIsGraceful() {
         assertThat(yaml().getProperty("server.shutdown")).isEqualTo("graceful");
     }
+
+    @Test
+    void theStaleJobTimeoutIsSizedForAFullFirstRun() {
+        // PT2H reaped a healthy first run of ~3,000 series (about 2 h 10 min at Orion's 5 requests/s).
+        assertThat(java.time.Duration.parse(yaml().getProperty("datasync.job.max-running-duration")))
+                .isGreaterThanOrEqualTo(java.time.Duration.ofHours(6));
+    }
+
+    @Test
+    void ledgerPointHonorsRetryAfterUpToAConfiguredCap() {
+        assertThat(yaml().getProperty("ledgerpoint.max-retry-after")).isEqualTo("60s");
+    }
 }

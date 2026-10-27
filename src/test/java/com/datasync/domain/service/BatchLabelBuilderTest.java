@@ -24,4 +24,10 @@ class BatchLabelBuilderTest {
 
         assertThat(label).isEqualTo("UPD_SERIES_ALPHA_001_U1_TZ_C");
     }
+
+    @Test
+    void usesAPlaceholderWhenTheUnitIsMissing() {
+        assertThat(BatchLabelBuilder.build(List.of(ChangeType.NEW), "S", null, "TZ_C")).isEqualTo("INS_S_NA_TZ_C");
+        assertThat(BatchLabelBuilder.build(List.of(ChangeType.NEW), "S", " ", "TZ_C")).isEqualTo("INS_S_NA_TZ_C");
+    }
 }

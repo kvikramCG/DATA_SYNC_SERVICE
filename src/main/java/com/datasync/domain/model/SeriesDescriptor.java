@@ -21,6 +21,11 @@ import java.time.LocalDateTime;
  * <p>{@code timeZone} is {@code null} when Orion reported a timezone code this service does not
  * support (spec &sect;6.2); {@code orionTimeZoneCode} then still carries the raw code so the Task
  * can fail with {@code UNSUPPORTED_TIMEZONE} and a useful detail message.
+ *
+ * <p>{@code catalogIssue} is non-null when Orion's list entry for this series had a missing or
+ * unreadable date (spec &sect;4.2 lists all three as always present). The series is still kept (a Task
+ * needs a series row) so that Task can fail with {@code INTERNAL_ERROR} and this text, instead of the
+ * bad entry failing the whole job. It is transient: it is not stored, only carried for the current run.
  */
 public record SeriesDescriptor(
         Long id,
@@ -31,7 +36,8 @@ public record SeriesDescriptor(
         LocalDateTime earliestDataDate,
         LocalDateTime latestDataDate,
         LocalDate lastSyncedDate,
-        int orionTimeZoneCode
+        int orionTimeZoneCode,
+        String catalogIssue
 ) {
 
     /** Convenience constructor for series with a supported timezone. */
@@ -39,6 +45,24 @@ public record SeriesDescriptor(
                              LocalDateTime lastUpdatedDate, LocalDateTime earliestDataDate,
                              LocalDateTime latestDataDate, LocalDate lastSyncedDate) {
         this(id, name, type, timeZone, lastUpdatedDate, earliestDataDate, latestDataDate, lastSyncedDate,
-                timeZone == null ? 0 : timeZone.orionCode());
+                timeZone == null ? 0 : timeZone.orionCode(), null);
+    }
+
+    /** A series with a valid catalog entry. */
+    public SeriesDescriptor(Long id, String name, SeriesType type, TimeZoneCode timeZone,
+                             LocalDateTime lastUpdatedDate, LocalDateTime earliestDataDate,
+                             LocalDateTime latestDataDate, LocalDate lastSyncedDate, int orionTimeZoneCode) {
+        this(id, name, type, timeZone, lastUpdatedDate, earliestDataDate, latestDataDate, lastSyncedDate,
+                orionTimeZoneCode, null);
+    }
+
+    public SeriesDescriptor withCatalogIssue(String issue) {
+        return new SeriesDescriptor(id, name, type, timeZone, lastUpdatedDate, earliestDataDate, latestDataDate,
+                lastSyncedDate, orionTimeZoneCode, issue);
+    }
+
+    public SeriesDescriptor withLastSyncedDate(LocalDate newLastSyncedDate) {
+        return new SeriesDescriptor(id, name, type, timeZone, lastUpdatedDate, earliestDataDate, latestDataDate,
+                newLastSyncedDate, orionTimeZoneCode, catalogIssue);
     }
 }

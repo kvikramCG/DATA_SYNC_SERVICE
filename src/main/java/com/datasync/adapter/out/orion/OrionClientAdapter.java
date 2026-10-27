@@ -1,11 +1,13 @@
 package com.datasync.adapter.out.orion;
 
+import com.datasync.adapter.out.http.RetryAfterSupport;
 import com.datasync.adapter.out.orion.dto.OrionSeriesDto;
 import com.datasync.adapter.out.orion.dto.OrionSeriesListResponse;
 import com.datasync.adapter.out.orion.dto.OrionSeriesValuesResponse;
 import com.datasync.adapter.out.orion.dto.OrionValueDto;
 import com.datasync.domain.exception.OrionAuthException;
 import com.datasync.domain.exception.OrionClientException;
+import com.datasync.domain.exception.OrionDataException;
 import com.datasync.domain.exception.OrionRateLimitedException;
 import com.datasync.domain.exception.OrionTransientException;
 import com.datasync.domain.exception.UnsupportedTimeZoneException;
@@ -31,6 +33,7 @@ import org.springframework.web.client.RestClient;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -115,18 +118,48 @@ public class OrionClientAdapter implements SeriesSourcePort {
             } catch (UnsupportedTimeZoneException ex) {
                 log.warn("Series {} has an unsupported timezone code: {}", dto.seriesName(), ex.getMessage());
             }
+            List<String> issues = new ArrayList<>();
+            LocalDateTime lastUpdated = parseCatalogDate("lastUpdatedDate", dto.lastUpdatedDate(), issues);
+            LocalDateTime earliest = parseCatalogDate("earliestDataDate", dto.earliestDataDate(), issues);
+            LocalDateTime latest = parseCatalogDate("latestDataDate", dto.latestDataDate(), issues);
+            String catalogIssue = issues.isEmpty() ? null : String.join("; ", issues);
+            if (catalogIssue != null) {
+                log.warn("Series {} has an invalid catalog entry, its Task will fail: {}", dto.seriesName(), catalogIssue);
+            }
             result.add(new SeriesDescriptor(
                     null, // not yet persisted; SeriesRepositoryPort.upsertAll assigns the id
                     dto.seriesName(),
                     type,
                     timeZone,
-                    OrionDateFormat.parse(dto.lastUpdatedDate()),
-                    OrionDateFormat.parse(dto.earliestDataDate()),
-                    OrionDateFormat.parse(dto.latestDataDate()),
+                    lastUpdated,
+                    earliest,
+                    latest,
                     null, // last_synced_date is service-side state, not known from Orion's list call
-                    dto.timeZone()));
+                    dto.timeZone(),
+                    catalogIssue));
         }
         return result;
+    }
+
+    /**
+     * A missing or unreadable catalog date must not fail the whole list call (and so the whole job):
+     * it is reported on that one series, whose Task then fails (spec &sect;8 "Isolation").
+     */
+    private static LocalDateTime parseCatalogDate(String field, String raw, List<String> issues) {
+        if (raw == null || raw.isBlank()) {
+            issues.add(field + " is missing");
+            return null;
+        }
+        try {
+            return OrionDateFormat.parse(raw);
+        } catch (DateTimeParseException ex) {
+            issues.add(field + " '" + abbreviate(raw) + "' is not a valid Orion date");
+            return null;
+        }
+    }
+
+    private static String abbreviate(String raw) {
+        return raw.length() <= 40 ? raw : raw.substring(0, 40) + "...";
     }
 
     @Override
@@ -194,17 +227,7 @@ public class OrionClientAdapter implements SeriesSourcePort {
 
     /** Spec &sect;4: {@code Retry-After} is a number of seconds. Anything else is ignored. */
     static Duration parseRetryAfter(HttpHeaders headers) {
-        String value = headers.getFirst(HttpHeaders.RETRY_AFTER);
-        if (value == null) {
-            return null;
-        }
-        try {
-            long seconds = Long.parseLong(value.trim());
-            return seconds < 0 ? null : Duration.ofSeconds(seconds);
-        } catch (NumberFormatException e) {
-            log.warn("Ignoring unparseable Retry-After header from Orion");
-            return null;
-        }
+        return RetryAfterSupport.parse(headers, log);
     }
 
     /**
@@ -229,17 +252,7 @@ public class OrionClientAdapter implements SeriesSourcePort {
     }
 
     private void pauseFor(Duration retryAfter) {
-        if (retryAfter == null || retryAfter.isZero() || retryAfter.isNegative()) {
-            return;
-        }
-        Duration cap = properties.getMaxRetryAfter();
-        Duration wait = cap != null && retryAfter.compareTo(cap) > 0 ? cap : retryAfter;
-        log.info("Orion asked us to back off; waiting {} before retrying", wait);
-        try {
-            Thread.sleep(wait);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        RetryAfterSupport.pause(retryAfter, properties.getMaxRetryAfter(), "Orion", log);
     }
 
     /** Runs one HTTP attempt and counts its outcome ({@code datasync.orion.requests}). */
@@ -271,21 +284,55 @@ public class OrionClientAdapter implements SeriesSourcePort {
         if (response == null) {
             throw new OrionClientException("Orion returned an empty values response");
         }
-        List<RawSeriesValue> rawValues = response.values() == null
-                ? List.of()
-                : response.values().stream()
-                        .map(this::toRawValue)
-                        .toList();
+        List<RawSeriesValue> rawValues = new ArrayList<>();
+        if (response.values() != null) {
+            int droppedNullValues = 0;
+            for (OrionValueDto dto : response.values()) {
+                if (dto == null || dto.value() == null) {
+                    // Spec §6.8: do not invent data. Dropping the value leaves its interval missing, which
+                    // GapDetector then reports as a GAP_MISSING warning (Task ends SUCCESS_WITH_WARNINGS).
+                    droppedNullValues++;
+                    continue;
+                }
+                rawValues.add(toRawValue(dto));
+            }
+            if (droppedNullValues > 0) {
+                log.warn("Orion returned {} value(s) with no reading for {}; treating them as gaps",
+                        droppedNullValues, response.seriesName());
+            }
+        }
         return new SeriesValuesResult(
                 response.seriesName(),
                 response.unit(),
                 response.granularity(),
                 TimeZoneCode.fromOrionCode(response.timeZone()),
-                OrionDateFormat.parse(response.asOfDate()),
+                parseAsOfDate(response.asOfDate()),
                 rawValues);
     }
 
+    /** {@code asOfDate} is informational only - nothing reads it - so a bad value must not fail the fetch. */
+    private LocalDateTime parseAsOfDate(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return OrionDateFormat.parse(raw);
+        } catch (DateTimeParseException ex) {
+            log.debug("Ignoring unparseable asOfDate from Orion");
+            return null;
+        }
+    }
+
     private RawSeriesValue toRawValue(OrionValueDto dto) {
-        return new RawSeriesValue(OrionDateFormat.parse(dto.startDate()), dto.repeatedHour(), dto.value());
+        if (dto.startDate() == null || dto.startDate().isBlank()) {
+            throw new OrionDataException("Orion returned a value with no startDate");
+        }
+        try {
+            return new RawSeriesValue(OrionDateFormat.parse(dto.startDate()), dto.repeatedHour(), dto.value());
+        } catch (DateTimeParseException ex) {
+            // The whole series fails for this run: a value whose time is unknown cannot be placed in an interval.
+            throw new OrionDataException("Orion returned a value with an unreadable startDate '"
+                    + abbreviate(dto.startDate()) + "'");
+        }
     }
 }
